@@ -1,0 +1,6 @@
+{
+  "name": "VRPTW Solver",
+  "description": "An interactive full-stack Vehicle Routing Problem with Time Windows (VRPTW) solver using a high-performance Go-based metaheuristic engine and a responsive React visualization dashboard.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
