@@ -324,9 +324,24 @@ func main() {
 					
 					if len(destroyedCustomers) > 0 {
 						var subSol Solution
-						pureGoStart := time.Now()
+						lkhHandled := false
 
-						{
+						if *useLKH {
+							sendProgressLog(iter, bestSol, startTime, "LKH:TRIGGER", "Attempt %d: Invoking LKH3 on %d removed customers (vehicles cap = %d, no timeout)...", attempt, len(destroyedCustomers), len(finalDestroyIDs))
+							lkhStart := time.Now()
+							lkhSol := invokeLKHSubSolver(destroyedCustomers, depot, capacity, customerMap, len(finalDestroyIDs))
+							lkhElapsed := time.Since(lkhStart)
+
+							if lkhSol != nil {
+								subSol = *lkhSol
+								lkhHandled = true
+								sendProgressLog(iter, bestSol, startTime, "LKH:SUCCESS", "LKH3 sub-solve used (size=%d customers): %d vehicles, %.2f distance, took %v.", len(destroyedCustomers), subSol.TotalVehicles, subSol.TotalDistance, lkhElapsed)
+							} else {
+								sendProgressLog(iter, bestSol, startTime, "LKH:FALLBACK", "LKH3 sub-solve failed or returned an infeasible result (size=%d customers, took %v); falling back to the pure-Go sub-solver.", len(destroyedCustomers), lkhElapsed)
+							}
+						}
+
+						if !lkhHandled {
 							sendProgressLog(iter, bestSol, startTime, "HEURISTIC:SUB-SOLVER", "Attempt %d: Re-routing %d removed customers. Phase 1: K-Means Clustering -> Initial Sequence Insertion...", attempt, len(destroyedCustomers))
 
 							// Re-solve with our approach: Clustering -> Initial solution -> LNS (run on the subset)
@@ -374,24 +389,6 @@ func main() {
 									}
 								}
 								sendProgressLog(iter, bestSol, startTime, "HEURISTIC:SUB-SOLVER", "Phase 2 Complete. Subset LNS performed %d improvements. Final subset routing: %d vehicles, %.2f distance.", subImprovements, subSol.TotalVehicles, subSol.TotalDistance)
-							}
-						}
-						pureGoElapsed := time.Since(pureGoStart)
-
-						if *useLKH {
-							sendProgressLog(iter, bestSol, startTime, "LKH:TRIGGER", "Invoking LKH3 on %d removed customers (vehicles cap = %d, no timeout)...", len(destroyedCustomers), len(finalDestroyIDs))
-							lkhStart := time.Now()
-							lkhSol := invokeLKHSubSolver(destroyedCustomers, depot, capacity, customerMap, len(finalDestroyIDs))
-							lkhElapsed := time.Since(lkhStart)
-
-							if lkhSol != nil {
-								sendProgressLog(iter, bestSol, startTime, "LKH:COMPARE", "size=%d customers, %d vehicles cap | LKH3: %d vehicles, %.2f distance, took %v | Pure-Go: %d vehicles, %.2f distance, took %v", len(destroyedCustomers), len(finalDestroyIDs), lkhSol.TotalVehicles, lkhSol.TotalDistance, lkhElapsed, subSol.TotalVehicles, subSol.TotalDistance, pureGoElapsed)
-								if lkhSol.TotalVehicles < subSol.TotalVehicles || (lkhSol.TotalVehicles == subSol.TotalVehicles && lkhSol.TotalDistance < subSol.TotalDistance) {
-									subSol = *lkhSol
-									sendProgressLog(iter, bestSol, startTime, "LKH:SUCCESS", "LKH3 sub-solve used (size=%d customers): %d vehicles, %.2f distance, took %v.", len(destroyedCustomers), subSol.TotalVehicles, subSol.TotalDistance, lkhElapsed)
-								}
-							} else {
-								sendProgressLog(iter, bestSol, startTime, "LKH:FALLBACK", "LKH3 sub-solve failed or returned an infeasible result (size=%d customers, took %v); using the pure-Go sub-solver result.", len(destroyedCustomers), lkhElapsed)
 							}
 						}
 
