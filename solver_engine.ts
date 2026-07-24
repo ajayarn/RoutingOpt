@@ -1,4 +1,4 @@
-import { GoogleGenAI, Type } from '@google/genai';
+import { OllamaConfig, ollamaGenerateJSON } from './ollama_client';
 
 export interface Customer {
   id: number;
@@ -37,7 +37,7 @@ export interface SolutionData {
 
 export interface SolverParamsOptions {
   iterations: number;
-  algorithm: 'lns' | 'sa' | 'ortools' | 'lns-ortools' | string;
+  algorithm: 'lns' | 'sa' | string;
   seed?: number;
   optimal?: number;
   llmThreshold?: number;
@@ -385,7 +385,7 @@ export function repairRegret2(
 export async function runSolverStream(
   instance: VRPTWInstanceData,
   params: SolverParamsOptions,
-  getGeminiClient: () => GoogleGenAI | null,
+  getOllamaConfig: () => OllamaConfig | null,
   onMessage: (msg: ProgressMessage) => void,
   isCancelled: () => boolean
 ) {
@@ -436,28 +436,26 @@ export async function runSolverStream(
         bestVehicles: bestSol.totalVehicles,
         routes: bestSol.routes,
         computationTimeMs: Date.now() - startTime,
-        message: `[LLM:TRIGGER] Querying Gemini LLM to analyze and destroy sub-optimal routes...`
+        message: `[LLM:TRIGGER] Querying Ollama (${getOllamaConfig()?.model || 'local LLM'}) to analyze and destroy sub-optimal routes...`
       });
 
       try {
-        const client = getGeminiClient();
-        if (client) {
+        const config = getOllamaConfig();
+        if (config) {
+          const validVehicleIds = new Set(currentSol.routes.map(r => r.vehicleId));
           const routesDesc = currentSol.routes.map(r => `Vehicle ${r.vehicleId}: Distance = ${r.distance}, Customers = [${r.customerIds.join(', ')}]`).join('\n');
           const prompt = `Select 2 vehicle routes (by vehicleId) from this VRPTW solution to destroy:\n${routesDesc}\nReturn JSON array of vehicle IDs to destroy.`;
-          
-          const response = await client.models.generateContent({
-            model: 'gemini-3.6-flash',
-            contents: prompt,
-            config: {
-              responseMimeType: 'application/json',
-              responseSchema: {
-                type: Type.ARRAY,
-                items: { type: Type.INTEGER }
-              }
-            }
-          });
 
-          const vehicleIds: number[] = JSON.parse(response.text || '[]');
+          const rawVehicleIds = await ollamaGenerateJSON(
+            config,
+            'You are an expert operations research assistant helping choose vehicle routes to destroy in a VRPTW Large Neighborhood Search.',
+            prompt,
+            { type: 'array', items: { type: 'integer' } }
+          );
+
+          const vehicleIds: number[] = Array.isArray(rawVehicleIds)
+            ? rawVehicleIds.filter((id: any) => Number.isInteger(id) && validVehicleIds.has(id))
+            : [];
           if (vehicleIds.length > 0) {
             const destroySet = new Set(vehicleIds);
             const keptRoutes: number[][] = [];
@@ -477,7 +475,7 @@ export async function runSolverStream(
                 bestVehicles: bestSol.totalVehicles,
                 routes: bestSol.routes,
                 computationTimeMs: Date.now() - startTime,
-                message: `[LLM:DECISION] Gemini destroyed vehicles [${vehicleIds.join(', ')}] freeing ${removedCustomerIds.length} customers.`
+                message: `[LLM:DECISION] Ollama destroyed vehicles [${vehicleIds.join(', ')}] freeing ${removedCustomerIds.length} customers.`
               });
             }
           }
@@ -490,7 +488,7 @@ export async function runSolverStream(
           bestVehicles: bestSol.totalVehicles,
           routes: bestSol.routes,
           computationTimeMs: Date.now() - startTime,
-          message: `[LLM:FALLBACK] Gemini API unavailable (${err.message || err}). Falling back to heuristic destroy.`
+          message: `[LLM:FALLBACK] Ollama unavailable (${err.message || err}). Falling back to heuristic destroy.`
         });
       }
     }

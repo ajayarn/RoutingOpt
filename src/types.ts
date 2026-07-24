@@ -36,12 +36,13 @@ export interface SolverSolution {
 }
 
 export interface SolverParams {
-  algorithm: 'ga' | 'lns' | 'sa' | 'ortools' | 'lns-ortools';
+  algorithm: 'ga' | 'lns' | 'sa';
   maxIterations: number;
   populationSize?: number;
   mutationRate?: number;
   destroyRate?: number;
   llmThreshold?: number;
+  useLlm?: boolean;
 }
 
 export interface SolverProgressMessage {

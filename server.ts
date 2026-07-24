@@ -4,30 +4,10 @@ import fs from 'fs';
 import { spawn } from 'child_process';
 import readline from 'readline';
 import { createServer as createViteServer } from 'vite';
-import { GoogleGenAI, Type } from '@google/genai';
-import { runSolverStream } from './solver_engine';
+import { getOllamaConfigFromEnv, ollamaGenerateJSON } from './ollama_client';
 
 const app = express();
 const PORT = 3000;
-
-let ai: GoogleGenAI | null = null;
-function getGeminiClient(): GoogleGenAI {
-  if (!ai) {
-    const apiKey = process.env.GEMINI_API_KEY;
-    if (!apiKey) {
-      throw new Error('GEMINI_API_KEY environment variable is required');
-    }
-    ai = new GoogleGenAI({
-      apiKey,
-      httpOptions: {
-        headers: {
-          'User-Agent': 'aistudio-build',
-        }
-      }
-    });
-  }
-  return ai;
-}
 
 app.use(express.json({ limit: '10mb' }));
 
@@ -196,6 +176,8 @@ app.get('/api/solve-stream', async (req, res) => {
   const iterations = req.query.iterations ? parseInt(req.query.iterations as string, 10) : 1000;
   const algorithm = (req.query.algorithm as string) || 'lns';
   const llmThreshold = req.query.llmThreshold ? parseInt(req.query.llmThreshold as string, 10) : 20;
+  const optimal = req.query.optimal ? parseFloat(req.query.optimal as string) : undefined;
+  const useLlm = req.query.useLlm === 'true';
 
   if (!instanceId) {
     res.status(400).json({ error: 'Instance ID is required' });
@@ -214,53 +196,58 @@ app.get('/api/solve-stream', async (req, res) => {
   res.setHeader('Connection', 'keep-alive');
 
   let cancelled = false;
+
+  const args = [
+    '-file', filePath,
+    '-iterations', String(iterations),
+    '-algorithm', algorithm,
+    '-llm-threshold', String(llmThreshold),
+    '-seed', String(Date.now()),
+    `-use-llm=${useLlm}`
+  ];
+  if (optimal !== undefined && !isNaN(optimal)) {
+    args.push('-optimal', String(optimal));
+  }
+
+  const solverBinPath = path.join(process.cwd(), 'solver_bin');
+  const child = spawn(solverBinPath, args, { cwd: process.cwd() });
+
   req.on('close', () => {
     cancelled = true;
+    child.kill();
   });
 
-  try {
-    const content = fs.readFileSync(filePath, 'utf8');
-    const parsed = parseSolomonText(content);
-
-    const instanceData = {
-      name: parsed.name || instanceId.toUpperCase(),
-      vehicleNumber: parsed.vehicleNumber,
-      capacity: parsed.capacity,
-      depot: parsed.depot,
-      customers: parsed.customers
-    };
-
-    await runSolverStream(
-      instanceData,
-      {
-        iterations,
-        algorithm,
-        llmThreshold
-      },
-      () => {
-        try {
-          return getGeminiClient();
-        } catch (e) {
-          return null;
-        }
-      },
-      (msg) => {
-        if (!cancelled) {
-          res.write(`data: ${JSON.stringify(msg)}\n\n`);
-        }
-      },
-      () => cancelled
-    );
-  } catch (error: any) {
-    console.error('Error during solve stream:', error);
-    if (!cancelled) {
-      res.write(`data: ${JSON.stringify({ type: 'error', message: error.message || 'Internal solver error' })}\n\n`);
+  const rl = readline.createInterface({ input: child.stdout });
+  rl.on('line', (line) => {
+    if (cancelled) return;
+    const trimmed = line.trim();
+    if (!trimmed) return;
+    try {
+      JSON.parse(trimmed);
+    } catch {
+      console.error('Non-JSON line from solver_bin, dropping:', trimmed);
+      return;
     }
-  } finally {
+    res.write(`data: ${trimmed}\n\n`);
+  });
+
+  child.stderr.on('data', (data) => {
+    console.error('[solver_bin stderr]', data.toString());
+  });
+
+  child.on('error', (err) => {
+    console.error('Failed to spawn solver_bin:', err.message);
+    if (!cancelled) {
+      res.write(`data: ${JSON.stringify({ type: 'error', message: `Failed to launch solver_bin: ${err.message}` })}\n\n`);
+      res.end();
+    }
+  });
+
+  child.on('close', () => {
     if (!cancelled) {
       res.end();
     }
-  }
+  });
 });
 
 app.post('/api/llm-destroy', async (req, res) => {
@@ -271,8 +258,8 @@ app.post('/api/llm-destroy', async (req, res) => {
       return;
     }
 
-    const client = getGeminiClient();
-    
+    const ollamaConfig = getOllamaConfigFromEnv();
+
     const routesDescription = routes.map((r: any) => {
       return `Vehicle ${r.vehicleId}: Distance = ${r.distance.toFixed(2)}, Load = ${r.load}, Customers = [${r.customerIds.join(', ')}]`;
     }).join('\n');
@@ -300,64 +287,42 @@ Look for:
 Select ${minDestroy} to ${maxDestroy} vehicleId values to destroy.
 Return the selected vehicle IDs as a JSON array of integers.`;
 
-    let response;
+    let rawVehicleIds: unknown;
     try {
-      response = await client.models.generateContent({
-        model: 'gemini-3.6-flash',
-        contents: prompt,
-        config: {
-          systemInstruction,
-          responseMimeType: 'application/json',
-          responseSchema: {
-            type: Type.ARRAY,
-            items: {
-              type: Type.INTEGER
-            },
-            description: `List of vehicle IDs (exactly ${minDestroy} to ${maxDestroy}) to entirely destroy`
-          }
+      rawVehicleIds = await ollamaGenerateJSON(
+        ollamaConfig,
+        systemInstruction,
+        prompt,
+        {
+          type: 'array',
+          items: { type: 'integer' },
+          description: `List of vehicle IDs (exactly ${minDestroy} to ${maxDestroy}) to entirely destroy`
         }
+      );
+    } catch (error: any) {
+      console.log('Ollama LLM destroy request failed:', error.message || error);
+      // Return 200 OK with empty vehicleIds and error details, so the solver can gracefully fall back to random/heuristic destruction
+      res.json({
+        vehicleIds: [],
+        error: 'Ollama API was unavailable.',
+        details: error.message
       });
-    } catch (primaryError: any) {
-      console.log('Primary model gemini-3.6-flash failed or was rate-limited. Trying fallback model gemini-3.1-flash-lite...', primaryError.message || primaryError);
-      try {
-        response = await client.models.generateContent({
-          model: 'gemini-3.1-flash-lite',
-          contents: prompt,
-          config: {
-            systemInstruction,
-            responseMimeType: 'application/json',
-            responseSchema: {
-              type: Type.ARRAY,
-              items: {
-                type: Type.INTEGER
-              },
-              description: `List of vehicle IDs (exactly ${minDestroy} to ${maxDestroy}) to entirely destroy`
-            }
-          }
-        });
-      } catch (fallbackError: any) {
-        console.log('Both gemini-3.6-flash and gemini-3.1-flash-lite failed to generate content:', fallbackError.message || fallbackError);
-        // Return 200 OK with empty vehicleIds and error details, so Go solver can gracefully fall back to random/heuristic destruction
-        res.json({ 
-          vehicleIds: [], 
-          error: 'Gemini API was unavailable (rate limit or quota exceeded).', 
-          details: fallbackError.message 
-        });
-        return;
-      }
+      return;
     }
 
-    const text = response.text || '[]';
-    console.log('Gemini LLM destroy response:', text);
-    const vehicleIds = JSON.parse(text.trim());
-    
+    console.log('Ollama LLM destroy response:', rawVehicleIds);
+    const validVehicleIds = new Set(routes.map((r: any) => r.vehicleId));
+    const vehicleIds = Array.isArray(rawVehicleIds)
+      ? rawVehicleIds.filter((id: any) => Number.isInteger(id) && validVehicleIds.has(id))
+      : [];
+
     res.json({ vehicleIds });
   } catch (error: any) {
-    console.log('Failed to invoke Gemini for destroy:', error.message || error);
-    res.json({ 
-      vehicleIds: [], 
-      error: 'Failed to invoke Gemini due to an unexpected error.', 
-      details: error.message 
+    console.log('Failed to invoke Ollama for destroy:', error.message || error);
+    res.json({
+      vehicleIds: [],
+      error: 'Failed to invoke Ollama due to an unexpected error.',
+      details: error.message
     });
   }
 });

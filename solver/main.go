@@ -10,7 +10,6 @@ import (
 	"math/rand"
 	"net/http"
 	"os"
-	"os/exec"
 	"sort"
 	"strconv"
 	"strings"
@@ -54,6 +53,15 @@ type ProgressMessage struct {
 	Message           string  `json:"message,omitempty"`
 }
 
+// shouldTriggerStagnationSolver decides whether to invoke the stagnation-solver
+// intervention this iteration: whenever the global best has gone unchanged for
+// llmThreshold iterations. stagnationCounter is reset to 0 by the caller each
+// time this fires (and each time a new global best is found), which is what
+// throttles repeat firings - no additional gating is needed here.
+func shouldTriggerStagnationSolver(stagnationCounter, llmThreshold, totalIterations int) bool {
+	return llmThreshold > 0 && stagnationCounter >= llmThreshold && totalIterations >= llmThreshold
+}
+
 func main() {
 	filePath := flag.String("file", "", "Path to the Solomon instance file")
 	iterations := flag.Int("iterations", 1000, "Number of LNS iterations")
@@ -61,6 +69,7 @@ func main() {
 	seed := flag.Int64("seed", 42, "Random seed")
 	optimal := flag.Float64("optimal", 0.0, "Optimal distance for early stopping")
 	llmThreshold := flag.Int("llm-threshold", 20, "Iteration threshold for LLM intervention")
+	useLLM := flag.Bool("use-llm", false, "Use Ollama LLM via /api/llm-destroy instead of the pure-Go heuristic for stagnation destroy selection")
 	flag.Parse()
 
 	if *filePath == "" {
@@ -76,17 +85,6 @@ func main() {
 	name, _, capacity, depot, customers, err := parseSolomonFile(*filePath)
 	if err != nil {
 		sendError(fmt.Sprintf("Failed to parse file: %v", err))
-		return
-	}
-
-	if *algorithm == "ortools" {
-		cmd := exec.Command("python3", "solver/ortools_solver.py", "-file", *filePath, "-seconds", "10")
-		cmd.Stdout = os.Stdout
-		cmd.Stderr = os.Stderr
-		err := cmd.Run()
-		if err != nil {
-			sendError(fmt.Sprintf("OR-Tools standalone solver failed: %v", err))
-		}
 		return
 	}
 
@@ -111,11 +109,6 @@ func main() {
 
 	bestSol := cloneSolution(sol)
 
-	if *algorithm == "lns-ortools" {
-		bestSol = optimizeRoutesWithORTools(0, bestSol, *filePath, startTime)
-		sol = cloneSolution(bestSol)
-	}
-
 	if *optimal > 0.0 && bestSol.TotalDistance <= (*optimal)*1.001 {
 		sendResultWithMessage(bestSol, startTime, fmt.Sprintf("Initial solution is within 0.1%% of optimal solution (%.2f).", *optimal))
 		return
@@ -131,9 +124,6 @@ func main() {
 
 	// Stagnation and adaptive LLM intervention tracking
 	stagnationCounter := 0
-	hasLLMBeenCalled := false
-	var lastLLMCallBestDistance float64 = 99999999.0
-	var lastLLMCallBestVehicles int = 99999999
 
 	// 3. Solver Loop (LNS)
 	for iter := 1; iter <= *iterations; iter++ {
@@ -196,11 +186,7 @@ func main() {
 			// Check if it is the absolute best found so far
 			if sol.TotalVehicles < bestSol.TotalVehicles || (sol.TotalVehicles == bestSol.TotalVehicles && sol.TotalDistance < bestSol.TotalDistance) {
 				improvedThisIter = true
-				if *algorithm == "lns-ortools" {
-					bestSol = optimizeRoutesWithORTools(iter, sol, *filePath, startTime)
-				} else {
-					bestSol = cloneSolution(sol)
-				}
+				bestSol = cloneSolution(sol)
 				sendProgressLog(iter, bestSol, startTime, "LNS:DECISION", "[NEW BEST] Found better global solution: %d vehicles, %.2f distance (Reason: %s)!", bestSol.TotalVehicles, bestSol.TotalDistance, acceptReason)
 			} else {
 				if acceptCategory == "SA:DECISION" {
@@ -226,19 +212,10 @@ func main() {
 			return
 		}
 
-		// Smart Heuristic stagnation-solver intervention when we are stuck (stagnated for *llmThreshold iterations) 
-		// AND the solution has changed (improved) since the last stagnation solver call
-		triggerHeuristic := false
-		if *llmThreshold > 0 && stagnationCounter >= *llmThreshold && *iterations >= *llmThreshold {
-			if !hasLLMBeenCalled || bestSol.TotalVehicles < lastLLMCallBestVehicles || (bestSol.TotalVehicles == lastLLMCallBestVehicles && bestSol.TotalDistance < lastLLMCallBestDistance) {
-				triggerHeuristic = true
-			}
-		}
+		// Smart Heuristic stagnation-solver intervention when we are stuck (stagnated for *llmThreshold iterations)
+		triggerHeuristic := shouldTriggerStagnationSolver(stagnationCounter, *llmThreshold, *iterations)
 
 		if triggerHeuristic {
-			hasLLMBeenCalled = true
-			lastLLMCallBestDistance = bestSol.TotalDistance
-			lastLLMCallBestVehicles = bestSol.TotalVehicles
 			stagnationCounter = 0 // Reset stagnation counter since we are invoking heuristic now
 			
 			var history []DestructionAttempt
@@ -273,14 +250,46 @@ func main() {
 					maxDestroyRoutes = minDestroyRoutes
 				}
 
+				triggerCategory := "HEURISTIC:TRIGGER"
+				if *useLLM {
+					triggerCategory = "LLM:TRIGGER"
+				}
 				if attempt > 1 {
-					sendProgressLog(iter, bestSol, startTime, "HEURISTIC:TRIGGER", "Stagnation solver Attempt %d: Retrying with alternate seed routes. Increasing destroy size limit to %d-%d routes.", attempt, minDestroyRoutes, maxDestroyRoutes)
+					sendProgressLog(iter, bestSol, startTime, triggerCategory, "Stagnation solver Attempt %d: Retrying with alternate seed routes. Increasing destroy size limit to %d-%d routes.", attempt, minDestroyRoutes, maxDestroyRoutes)
+				} else if *useLLM {
+					sendProgressLog(iter, bestSol, startTime, triggerCategory, "Stagnation detected (stagnated for %d iters). Querying Ollama LLM (suggesting %d-%d routes to destroy).", stagnationCounter, minDestroyRoutes, maxDestroyRoutes)
 				} else {
-					sendProgressLog(iter, bestSol, startTime, "HEURISTIC:TRIGGER", "Stagnation detected (stagnated for %d iters). Invoking Smart Heuristic routing analyzer (suggesting %d-%d routes to destroy).", stagnationCounter, minDestroyRoutes, maxDestroyRoutes)
+					sendProgressLog(iter, bestSol, startTime, triggerCategory, "Stagnation detected (stagnated for %d iters). Invoking Smart Heuristic routing analyzer (suggesting %d-%d routes to destroy).", stagnationCounter, minDestroyRoutes, maxDestroyRoutes)
 				}
 
-				// Call our pure Go route-destruction heuristic
-				finalDestroyIDs := selectStagnationRoutesHeuristically(bestSol, history, minDestroyRoutes, maxDestroyRoutes, customerMap, attempt)
+				// Select vehicles to destroy: Ollama LLM if enabled, else the pure Go heuristic
+				var finalDestroyIDs []int
+				decisionCategory := "HEURISTIC:DECISION"
+				if *useLLM {
+					finalDestroyIDs = invokeLLMToSelectTrucks(bestSol, name, history, minDestroyRoutes, maxDestroyRoutes)
+
+					// Validate returned IDs against the actual current route set before using them
+					validVehicleIDs := make(map[int]bool)
+					for _, r := range bestSol.Routes {
+						validVehicleIDs[r.VehicleID] = true
+					}
+					filtered := make([]int, 0, len(finalDestroyIDs))
+					for _, id := range finalDestroyIDs {
+						if validVehicleIDs[id] {
+							filtered = append(filtered, id)
+						}
+					}
+					finalDestroyIDs = filtered
+
+					if len(finalDestroyIDs) == 0 {
+						sendProgressLog(iter, bestSol, startTime, "LLM:FALLBACK", "Ollama unavailable or returned no valid vehicles; falling back to heuristic destroy.")
+						finalDestroyIDs = selectStagnationRoutesHeuristically(bestSol, history, minDestroyRoutes, maxDestroyRoutes, customerMap, attempt)
+					} else {
+						decisionCategory = "LLM:DECISION"
+					}
+				} else {
+					finalDestroyIDs = selectStagnationRoutesHeuristically(bestSol, history, minDestroyRoutes, maxDestroyRoutes, customerMap, attempt)
+				}
 				
 				if len(finalDestroyIDs) > 0 {
 					// Collect customer IDs of destroyed routes to add to history if it fails
@@ -293,7 +302,7 @@ func main() {
 						}
 					}
 					
-					sendProgressLog(iter, bestSol, startTime, "HEURISTIC:DECISION", "Heuristic selected overlapping/inefficient vehicles %v for destruction (containing %d Customers %v).", finalDestroyIDs, len(destroyedCustIDs), destroyedCustIDs)
+					sendProgressLog(iter, bestSol, startTime, decisionCategory, "Selected overlapping/inefficient vehicles %v for destruction (containing %d Customers %v).", finalDestroyIDs, len(destroyedCustIDs), destroyedCustIDs)
 					
 					// Identify untouched routes vs destroyed routes
 					var untouchedRoutes []Route
@@ -425,10 +434,6 @@ func main() {
 		if iter%50 == 0 || iter == 1 || iter == *iterations {
 			sendProgress(iter, bestSol, startTime)
 		}
-	}
-
-	if *algorithm == "lns-ortools" {
-		bestSol = optimizeRoutesWithORTools(*iterations, bestSol, *filePath, startTime)
 	}
 
 	// Send final results
@@ -1338,40 +1343,4 @@ func sendError(err string) {
 	}
 	bytes, _ := json.Marshal(msg)
 	fmt.Println(string(bytes))
-}
-
-// Subproblem Router: optimize individual routes optimally using Google OR-Tools
-func optimizeRoutesWithORTools(iter int, sol Solution, filePath string, startTime time.Time) Solution {
-	sendProgressLog(iter, sol, startTime, "SUBPROBLEM:SOLVE", "Invoking Google OR-Tools TSPTW to re-sequence %d individual routes...", len(sol.Routes))
-	// Marshal routes to JSON
-	routesBytes, err := json.Marshal(sol.Routes)
-	if err != nil {
-		return sol
-	}
-
-	// Exec OR-Tools subproblem optimizer
-	cmd := exec.Command("python3", "solver/ortools_solver.py", "-file", filePath, "-mode", "subproblem", "-routes", string(routesBytes))
-	outputBytes, err := cmd.Output()
-	if err != nil {
-		// Fallback if subprocess fails
-		return sol
-	}
-
-	var optimizedRoutes []Route
-	err = json.Unmarshal(outputBytes, &optimizedRoutes)
-	if err != nil {
-		return sol
-	}
-
-	newSol := Solution{Routes: optimizedRoutes}
-	recalculateSolutionMetrics(&newSol)
-
-	diff := sol.TotalDistance - newSol.TotalDistance
-	if diff > 0.01 {
-		sendProgressLog(iter, newSol, startTime, "SUBPROBLEM:REDUCE", "Re-sequenced routes. Reduced total distance from %.2f to %.2f (Saved %.2f).", sol.TotalDistance, newSol.TotalDistance, diff)
-	} else {
-		sendProgressLog(iter, newSol, startTime, "SUBPROBLEM:SOLVE", "Re-sequenced routes. No distance reduction achieved (remained at %.2f).", sol.TotalDistance)
-	}
-
-	return newSol
 }

@@ -67,7 +67,8 @@ export default function App() {
   const [params, setParams] = useState<SolverParams>({
     algorithm: 'lns',
     maxIterations: 1000,
-    llmThreshold: 20
+    llmThreshold: 20,
+    useLlm: false
   });
 
   // Data states
@@ -81,7 +82,7 @@ export default function App() {
   const [progressHistory, setProgressHistory] = useState<Array<{ iteration: number; distance: number; vehicles: number }>>([]);
   const [activeMessage, setActiveMessage] = useState<string>('');
   const [solverLogs, setSolverLogs] = useState<string[]>([]);
-  const [logFilter, setLogFilter] = useState<'all' | 'improvements' | 'llm' | 'lns' | 'subproblems'>('all');
+  const [logFilter, setLogFilter] = useState<'all' | 'improvements' | 'llm' | 'lns'>('all');
   const [elapsedTime, setElapsedTime] = useState(0);
 
   // UI Selection states
@@ -221,7 +222,8 @@ export default function App() {
     const optimalObj = BEST_KNOWN_SOLUTIONS[selectedInstanceId];
     const optimalParam = optimalObj ? `&optimal=${optimalObj.distance}` : '';
     const llmParam = params.llmThreshold ? `&llmThreshold=${params.llmThreshold}` : '';
-    const url = `/api/solve-stream?instance=${selectedInstanceId}&iterations=${params.maxIterations}&algorithm=${params.algorithm}${optimalParam}${llmParam}`;
+    const useLlmParam = `&useLlm=${params.useLlm ? 'true' : 'false'}`;
+    const url = `/api/solve-stream?instance=${selectedInstanceId}&iterations=${params.maxIterations}&algorithm=${params.algorithm}${optimalParam}${llmParam}${useLlmParam}`;
     const es = new EventSource(url);
     eventSourceRef.current = es;
 
@@ -432,7 +434,7 @@ export default function App() {
           </div>
           <div>
             <h1 className="text-xl font-bold tracking-tight text-slate-900" id="header-title">VRPTW Optimization Engine</h1>
-            <p className="text-xs text-slate-500 font-normal">Vehicle Routing Problem with Time Windows Solver utilizing Go metaheuristics and Google OR-Tools engines</p>
+            <p className="text-xs text-slate-500 font-normal">Vehicle Routing Problem with Time Windows Solver utilizing LNS/SA metaheuristics with LLM-guided destroy operators</p>
           </div>
         </div>
         <div className="flex items-center space-x-3">
@@ -488,8 +490,6 @@ export default function App() {
               >
                 <option value="lns">Large Neighborhood Search (LNS)</option>
                 <option value="sa">Simulated Annealing + LNS</option>
-                <option value="ortools">Google OR-Tools (Full Standalone)</option>
-                <option value="lns-ortools">LNS + OR-Tools Subproblem Optimizer</option>
               </select>
             </div>
 
@@ -508,11 +508,11 @@ export default function App() {
               />
             </div>
 
-            {/* LLM Intervention Iteration Threshold */}
+            {/* Stagnation Threshold */}
             <div className="mb-6">
               <div className="flex justify-between items-center mb-1.5">
                 <label className="block text-xs font-semibold text-slate-600" htmlFor="llm-threshold-input">
-                  LLM Intervention Iteration
+                  Stagnation Threshold
                 </label>
                 <span className="text-xs text-blue-600 font-bold font-mono">
                   {params.llmThreshold === 0 ? 'Disabled' : `Iter ${params.llmThreshold}`}
@@ -529,8 +529,33 @@ export default function App() {
                 className="w-full text-sm border border-slate-300 rounded-lg p-2 bg-white focus:border-blue-500 focus:ring-1 focus:ring-blue-500 disabled:opacity-50"
               />
               <p className="text-[11px] text-slate-400 mt-1.5 leading-normal">
-                At this iteration, the solver prompts Gemini 1.5/2.0 to destroy poor routes and re-solve. Set to 0 to bypass.
+                After this many stagnant iterations with no improvement, the solver destroys 2-5 routes and re-solves using its built-in heuristic (or the Ollama LLM, if enabled below). Set to 0 to bypass.
               </p>
+
+              {/* Ollama LLM destroy switch */}
+              <div className="flex items-center justify-between mt-4 pt-4 border-t border-slate-100">
+                <div>
+                  <label className="block text-xs font-semibold text-slate-600" htmlFor="use-llm-toggle">
+                    Use Ollama LLM for destroy selection
+                  </label>
+                  <p className="text-[11px] text-slate-400 mt-0.5 leading-normal max-w-[220px]">
+                    Off (default): the Go solver's own heuristic picks routes to destroy. On: a local Ollama LLM (gemma4:12b) is asked instead.
+                  </p>
+                </div>
+                <button
+                  id="use-llm-toggle"
+                  type="button"
+                  role="switch"
+                  aria-checked={!!params.useLlm}
+                  disabled={isSolving}
+                  onClick={() => setParams(prev => ({ ...prev, useLlm: !prev.useLlm }))}
+                  className={`shrink-0 relative inline-flex h-5 w-9 items-center rounded-full transition-colors disabled:opacity-50 ${params.useLlm ? 'bg-blue-600' : 'bg-slate-300'}`}
+                >
+                  <span
+                    className={`inline-block h-3.5 w-3.5 transform rounded-full bg-white transition-transform ${params.useLlm ? 'translate-x-5' : 'translate-x-1'}`}
+                  />
+                </button>
+              </div>
             </div>
 
             {/* Action Trigger Buttons */}
@@ -637,292 +662,13 @@ export default function App() {
               )}
             </div>
           )}
-
-          {/* Section 3: Solver Progress & Convergence History */}
-          <div className="bg-white border border-slate-200 rounded-xl shadow-sm p-5 flex-1 flex flex-col" id="panel-solver-status">
-            <div className="flex items-center justify-between border-b border-slate-100 pb-3 mb-4">
-              <div className="flex items-center space-x-2">
-                <Clock className="h-4 w-4 text-blue-600" />
-                <h2 className="text-sm font-bold uppercase tracking-wider text-slate-500">Status & History</h2>
-              </div>
-              {isSolving && (
-                <span className="inline-flex h-2 w-2 relative rounded-full bg-emerald-500">
-                  <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-emerald-400 opacity-75"></span>
-                </span>
-              )}
-            </div>
-
-            {/* Active message log / Rich Terminal Console */}
-            <div className="flex flex-col flex-1 min-h-[380px] border border-slate-200 rounded-lg overflow-hidden bg-slate-900 text-slate-100 font-mono text-xs mb-4">
-              {/* Terminal Header & Filter Bar */}
-              <div className="bg-slate-800 border-b border-slate-700 px-3 py-2 flex flex-col gap-2">
-                <div className="flex items-center justify-between text-[11px] text-slate-400">
-                  <div className="flex items-center space-x-1.5 font-bold">
-                    <span className="w-2.5 h-2.5 rounded-full bg-red-500 inline-block"></span>
-                    <span className="w-2.5 h-2.5 rounded-full bg-yellow-500 inline-block"></span>
-                    <span className="w-2.5 h-2.5 rounded-full bg-emerald-500 inline-block"></span>
-                    <span className="ml-1 text-slate-300">SOLVER CONSOLE</span>
-                  </div>
-                  {isSolving && <span className="animate-pulse text-emerald-400 font-medium">Solving (Elapsed: {elapsedTime}s)</span>}
-                </div>
-
-                {/* Filter Pills */}
-                <div className="flex flex-wrap gap-1 text-[10px]">
-                  {(['all', 'improvements', 'llm', 'lns', 'subproblems'] as const).map((filter) => {
-                    const label = {
-                      all: 'All',
-                      improvements: '🏆 Improvements',
-                      llm: '🧠 Smart Heuristic',
-                      lns: '⚡ LNS / SA',
-                      subproblems: '⚙️ Subproblems',
-                    }[filter];
-
-                    const activeStyle = {
-                      all: 'bg-slate-700 text-white',
-                      improvements: 'bg-emerald-800/80 text-emerald-200 border-emerald-700/50',
-                      llm: 'bg-violet-900 text-violet-200 border-violet-800',
-                      lns: 'bg-blue-900/60 text-blue-200 border-blue-800',
-                      subproblems: 'bg-cyan-900/60 text-cyan-200 border-cyan-800',
-                    }[filter];
-
-                    return (
-                      <button
-                        key={filter}
-                        onClick={() => setLogFilter(filter)}
-                        className={`px-2 py-0.5 rounded border transition-colors ${logFilter === filter ? activeStyle : 'bg-slate-800/40 text-slate-400 border-slate-800/80 hover:bg-slate-800 hover:text-slate-200'}`}
-                      >
-                        {label}
-                      </button>
-                    );
-                  })}
-                </div>
-              </div>
-
-              {/* Log Scroll Box */}
-              <div 
-                ref={logScrollRef}
-                className="flex-1 p-3 overflow-y-auto space-y-1.5 font-mono text-[11px] leading-relaxed max-h-[300px] h-[300px] bg-slate-950/95"
-              >
-                {solverLogs.length === 0 ? (
-                  <div className="text-slate-500 italic h-full flex items-center justify-center">
-                    Ready. Click 'Start Optimization' to watch decision traces...
-                  </div>
-                ) : (
-                  (() => {
-                    // Filter logs based on selection
-                    const filtered = solverLogs.filter(log => {
-                      if (logFilter === 'all') return true;
-                      if (logFilter === 'improvements') {
-                        return log.includes('[NEW BEST]') || log.includes('[SUCCESS]') || log.includes('0.1%') || log.includes('Initial solution') || log.includes('started') || log.includes('results');
-                      }
-                      if (logFilter === 'llm') {
-                        return log.includes('[LLM:') || log.includes('[HEURISTIC:') || log.includes('Gemini') || log.includes('Heuristic') || log.includes('Bypassing') || log.includes('Attempt');
-                      }
-                      if (logFilter === 'lns') {
-                        return log.includes('[LNS:') || log.includes('[SA:') || log.includes('Simulated Annealing') || log.includes('Candidate');
-                      }
-                      if (logFilter === 'subproblems') {
-                        return log.includes('[SUBPROBLEM:') || log.includes('OR-Tools') || log.includes('TSPTW');
-                      }
-                      return true;
-                    });
-
-                    if (filtered.length === 0) {
-                      return <div className="text-slate-600 italic text-center pt-8">No logs match this filter.</div>;
-                    }
-
-                    return filtered.map((log, index) => {
-                      // Attempt to parse category: e.g. [LNS:CHOOSE] Message
-                      const categoryMatch = log.match(/^\[(.*?)\] (.*)$/);
-                      if (categoryMatch) {
-                        const category = categoryMatch[1];
-                        const text = categoryMatch[2];
-
-                        // Style category badge
-                        let badgeStyle = "bg-slate-800 text-slate-400 border-slate-700";
-                        let textStyle = "text-slate-300";
-
-                        if (category === 'LNS:CHOOSE') {
-                          badgeStyle = "bg-slate-900 text-slate-500 border-slate-800";
-                          textStyle = "text-slate-400";
-                        } else if (category === 'LNS:ACCEPT') {
-                          badgeStyle = "bg-emerald-950 text-emerald-400 border-emerald-900";
-                          textStyle = "text-slate-300";
-                        } else if (category === 'LNS:REJECT') {
-                          badgeStyle = "bg-slate-900 text-slate-600 border-slate-900";
-                          textStyle = "text-slate-500";
-                        } else if (category === 'LNS:DECISION') {
-                          if (text.includes('[NEW BEST]')) {
-                            badgeStyle = "bg-emerald-500 text-white font-bold border-emerald-400";
-                            textStyle = "text-emerald-300 font-bold";
-                          } else {
-                            badgeStyle = "bg-emerald-900 text-emerald-300 border-emerald-800";
-                            textStyle = "text-slate-300";
-                          }
-                        } else if (category === 'SA:DECISION') {
-                          badgeStyle = "bg-amber-950 text-amber-400 border-amber-900";
-                          textStyle = "text-amber-200/95";
-                        } else if (category === 'SUBPROBLEM:SOLVE') {
-                          badgeStyle = "bg-blue-950 text-blue-400 border-blue-900";
-                          textStyle = "text-slate-400";
-                        } else if (category === 'SUBPROBLEM:REDUCE') {
-                          badgeStyle = "bg-cyan-950 text-cyan-400 border-cyan-900";
-                          textStyle = "text-cyan-300 font-medium";
-                        } else if (category === 'LLM:TRIGGER' || category === 'HEURISTIC:TRIGGER') {
-                          badgeStyle = "bg-violet-950 text-violet-400 border-violet-900";
-                          textStyle = "text-violet-300";
-                        } else if (category === 'LLM:DECISION' || category === 'HEURISTIC:DECISION') {
-                          badgeStyle = "bg-violet-900 text-violet-200 border-violet-800";
-                          textStyle = "text-violet-100 font-semibold";
-                        } else if (category === 'LLM:SUB-SOLVER' || category === 'HEURISTIC:SUB-SOLVER') {
-                          badgeStyle = "bg-indigo-950 text-indigo-400 border-indigo-900";
-                          textStyle = "text-slate-300";
-                        } else if (category === 'LLM:MERGE' || category === 'HEURISTIC:MERGE') {
-                          badgeStyle = "bg-blue-950 text-blue-400 border-blue-950";
-                          textStyle = "text-slate-400";
-                        } else if (category === 'LLM:SUCCESS' || category === 'HEURISTIC:SUCCESS') {
-                          badgeStyle = "bg-emerald-500 text-white font-bold border-emerald-400";
-                          textStyle = "text-emerald-300 font-bold animate-pulse";
-                        } else if (category === 'LLM:FAILURE' || category === 'HEURISTIC:FAILURE') {
-                          badgeStyle = "bg-rose-950 text-rose-400 border-rose-900";
-                          textStyle = "text-rose-300/80";
-                        }
-
-                        return (
-                          <div key={index} className="flex items-start gap-1.5 hover:bg-slate-900/50 py-0.5 px-1 rounded transition-colors">
-                            <span className={`px-1.5 py-0.5 rounded text-[9px] uppercase tracking-wider border font-bold ${badgeStyle}`}>
-                              {category}
-                            </span>
-                            <span className={textStyle}>{text}</span>
-                          </div>
-                        );
-                      }
-
-                      // Default fallbacks (errors, starts)
-                      const isError = log.toLowerCase().includes('error');
-                      const isGemini = log.includes('Gemini') || log.includes('LLM');
-                      const defaultClass = isError 
-                        ? 'text-red-400 font-bold' 
-                        : isGemini 
-                          ? 'text-violet-300 font-medium' 
-                          : 'text-slate-400';
-
-                      return (
-                        <div key={index} className={`flex items-start space-x-1.5 py-0.5 px-1 ${defaultClass}`}>
-                          <span className="text-slate-600">›</span>
-                          <span>{log}</span>
-                        </div>
-                      );
-                    });
-                  })()
-                )}
-              </div>
-            </div>
-
-            {/* Best Solution metrics */}
-            {solution && (
-              <div className="grid grid-cols-2 gap-3 mb-4">
-                <div className="bg-slate-50 rounded-lg p-2.5 border border-slate-100">
-                  <span className="block text-[10px] font-bold uppercase text-slate-400">Vehicles Used</span>
-                  <span className="text-lg font-bold text-slate-800 flex items-center space-x-1.5">
-                    <Truck className="h-4 w-4 text-slate-500" />
-                    <span>{solution.totalVehicles}</span>
-                  </span>
-                </div>
-                <div className="bg-slate-50 rounded-lg p-2.5 border border-slate-100">
-                  <span className="block text-[10px] font-bold uppercase text-slate-400">Best Distance</span>
-                  <span className="text-lg font-bold text-slate-800 flex items-center space-x-1.5">
-                    <TrendingDown className="h-4 w-4 text-slate-500" />
-                    <span>{solution.totalDistance.toFixed(2)}</span>
-                  </span>
-                </div>
-              </div>
-            )}
-
-            {/* Custom SVG Sparkline for Convergence history */}
-            {progressHistory.length > 1 && (
-              <div className="flex-1 flex flex-col min-h-[180px]">
-                <span className="text-[10px] font-bold uppercase tracking-wider text-slate-400 mb-2 flex items-center justify-between">
-                  <span>Convergence Curve</span>
-                  <span className="font-normal text-slate-500">Distance vs Iteration</span>
-                </span>
-                <div className="flex-1 bg-slate-50/50 rounded-lg border border-slate-200 relative p-3 min-h-[140px] flex items-center justify-center">
-                  <svg className="w-full h-full max-h-[160px]" viewBox="0 0 240 120" id="svg-convergence-curve">
-                    {(() => {
-                      const maxDist = Math.max(...progressHistory.map(p => p.distance));
-                      const minDist = Math.min(...progressHistory.map(p => p.distance));
-                      const distDiff = maxDist - minDist || 1;
-                      const iterMax = Math.max(...progressHistory.map(p => p.iteration)) || 1;
-                      const iterMin = Math.min(...progressHistory.map(p => p.iteration)) || 0;
-                      const iterDiff = iterMax - iterMin || 1;
-
-                      const points = progressHistory.map((p) => {
-                        const x = 38 + ((p.iteration - iterMin) / iterDiff) * 187;
-                        const y = 95 - ((p.distance - minDist) / distDiff) * 80;
-                        return `${x.toFixed(1)},${y.toFixed(1)}`;
-                      }).join(' ');
-
-                      const startY = 95 - ((progressHistory[0].distance - minDist) / distDiff) * 80;
-                      const endY = 95 - ((progressHistory[progressHistory.length - 1].distance - minDist) / distDiff) * 80;
-
-                      return (
-                        <>
-                          {/* Grid lines */}
-                          <line x1="38" y1="15" x2="225" y2="15" stroke="#f1f5f9" strokeWidth="1" strokeDasharray="2,2" />
-                          <line x1="38" y1="55" x2="225" y2="55" stroke="#f1f5f9" strokeWidth="1" strokeDasharray="2,2" />
-                          <line x1="131.5" y1="15" x2="131.5" y2="95" stroke="#f1f5f9" strokeWidth="1" strokeDasharray="2,2" />
-
-                          {/* Axes */}
-                          <line x1="38" y1="15" x2="38" y2="95" stroke="#cbd5e1" strokeWidth="1" />
-                          <line x1="38" y1="95" x2="225" y2="95" stroke="#cbd5e1" strokeWidth="1" />
-
-                          {/* Y-Ticks */}
-                          <line x1="34" y1="15" x2="38" y2="15" stroke="#cbd5e1" strokeWidth="1" />
-                          <line x1="34" y1="55" x2="38" y2="55" stroke="#cbd5e1" strokeWidth="1" />
-                          <line x1="34" y1="95" x2="38" y2="95" stroke="#cbd5e1" strokeWidth="1" />
-
-                          {/* Y-labels */}
-                          <text x="31" y="18" textAnchor="end" className="text-[7.5px] fill-slate-500 font-mono font-medium">{maxDist.toFixed(1)}</text>
-                          <text x="31" y="58" textAnchor="end" className="text-[7.5px] fill-slate-500 font-mono font-medium">{(minDist + distDiff * 0.5).toFixed(1)}</text>
-                          <text x="31" y="98" textAnchor="end" className="text-[7.5px] fill-slate-600 font-mono font-bold">{minDist.toFixed(1)}</text>
-
-                          {/* X-Ticks */}
-                          <line x1="38" y1="95" x2="38" y2="99" stroke="#cbd5e1" strokeWidth="1" />
-                          <line x1="131.5" y1="95" x2="131.5" y2="99" stroke="#cbd5e1" strokeWidth="1" />
-                          <line x1="225" y1="95" x2="225" y2="99" stroke="#cbd5e1" strokeWidth="1" />
-
-                          {/* X-labels */}
-                          <text x="38" y="107" textAnchor="middle" className="text-[7.5px] fill-slate-500 font-mono font-medium">{iterMin}</text>
-                          <text x="131.5" y="107" textAnchor="middle" className="text-[7.5px] fill-slate-500 font-mono font-medium">{Math.round(iterMin + iterDiff * 0.5)}</text>
-                          <text x="225" y="107" textAnchor="middle" className="text-[7.5px] fill-slate-500 font-mono font-medium">{iterMax}</text>
-
-                          {/* Axis Titles */}
-                          <text transform="translate(10, 55) rotate(-90)" textAnchor="middle" className="text-[7.5px] font-bold uppercase tracking-wider fill-slate-400">Distance</text>
-                          <text x="131.5" y="117" textAnchor="middle" className="text-[7.5px] font-bold uppercase tracking-wider fill-slate-400">Iteration</text>
-
-                          {/* Thinner line */}
-                          <polyline
-                            fill="none"
-                            stroke="#3b82f6"
-                            strokeWidth="1.2"
-                            points={points}
-                          />
-
-                          {/* Starting and ending dots */}
-                          <circle cx="38" cy={startY} r="2" fill="#ef4444" />
-                          <circle cx="225" cy={endY} r="2" fill="#10b981" />
-                        </>
-                      );
-                    })()}
-                  </svg>
-                </div>
-              </div>
-            )}
-          </div>
         </div>
 
-        {/* CENTER COLUMN: SVG Routing Visualization Map */}
-        <div className="lg:col-span-6 flex flex-col bg-white border border-slate-200 rounded-xl shadow-sm overflow-hidden min-h-[500px]">
+        {/* RIGHT COLUMN: Main Content Stack (Routing Visualization, Route Explorer, Status & History) */}
+        <div className="lg:col-span-9 flex flex-col gap-6 overflow-hidden">
+
+        {/* Section 1: SVG Routing Visualization Map */}
+        <div className="flex flex-col bg-white border border-slate-200 rounded-xl shadow-sm overflow-hidden min-h-[500px]">
           <div className="px-5 py-4 border-b border-slate-100 flex items-center justify-between bg-white" id="panel-map-header">
             <div className="flex items-center space-x-2">
               <Layers className="h-4 w-4 text-blue-600" />
@@ -1192,8 +938,8 @@ export default function App() {
           </div>
         </div>
 
-        {/* RIGHT COLUMN: Route Inspector & Time Windows gantt timeline */}
-        <div className="lg:col-span-3 flex flex-col gap-6 overflow-hidden">
+        {/* Section 2: Route Explorer (Route Inspector & Time Windows gantt timeline) */}
+        <div className="flex flex-col gap-6 overflow-hidden">
           {/* Section 1: Route Inspector Header & List */}
           <div className="bg-white border border-slate-200 rounded-xl shadow-sm p-5 flex flex-col max-h-[250px] overflow-hidden" id="panel-routes-list">
             <div className="flex items-center space-x-2 border-b border-slate-100 pb-3 mb-3">
@@ -1342,6 +1088,278 @@ export default function App() {
               </div>
             </div>
           )}
+        </div>
+
+          {/* Section 3: Solver Progress & Convergence History */}
+          <div className="bg-white border border-slate-200 rounded-xl shadow-sm p-5 flex-1 flex flex-col" id="panel-solver-status">
+            <div className="flex items-center justify-between border-b border-slate-100 pb-3 mb-4">
+              <div className="flex items-center space-x-2">
+                <Clock className="h-4 w-4 text-blue-600" />
+                <h2 className="text-sm font-bold uppercase tracking-wider text-slate-500">Status & History</h2>
+              </div>
+              {isSolving && (
+                <span className="inline-flex h-2 w-2 relative rounded-full bg-emerald-500">
+                  <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-emerald-400 opacity-75"></span>
+                </span>
+              )}
+            </div>
+
+            {/* Active message log / Rich Terminal Console */}
+            <div className="flex flex-col flex-1 min-h-[380px] border border-slate-200 rounded-lg overflow-hidden bg-slate-900 text-slate-100 font-mono text-xs mb-4">
+              {/* Terminal Header & Filter Bar */}
+              <div className="bg-slate-800 border-b border-slate-700 px-3 py-2 flex flex-col gap-2">
+                <div className="flex items-center justify-between text-[11px] text-slate-400">
+                  <div className="flex items-center space-x-1.5 font-bold">
+                    <span className="w-2.5 h-2.5 rounded-full bg-red-500 inline-block"></span>
+                    <span className="w-2.5 h-2.5 rounded-full bg-yellow-500 inline-block"></span>
+                    <span className="w-2.5 h-2.5 rounded-full bg-emerald-500 inline-block"></span>
+                    <span className="ml-1 text-slate-300">SOLVER CONSOLE</span>
+                  </div>
+                  {isSolving && <span className="animate-pulse text-emerald-400 font-medium">Solving (Elapsed: {elapsedTime}s)</span>}
+                </div>
+
+                {/* Filter Pills */}
+                <div className="flex flex-wrap gap-1 text-[10px]">
+                  {(['all', 'improvements', 'llm', 'lns'] as const).map((filter) => {
+                    const label = {
+                      all: 'All',
+                      improvements: '🏆 Improvements',
+                      llm: '🧠 Smart Heuristic',
+                      lns: '⚡ LNS / SA',
+                    }[filter];
+
+                    const activeStyle = {
+                      all: 'bg-slate-700 text-white',
+                      improvements: 'bg-emerald-800/80 text-emerald-200 border-emerald-700/50',
+                      llm: 'bg-violet-900 text-violet-200 border-violet-800',
+                      lns: 'bg-blue-900/60 text-blue-200 border-blue-800',
+                    }[filter];
+
+                    return (
+                      <button
+                        key={filter}
+                        onClick={() => setLogFilter(filter)}
+                        className={`px-2 py-0.5 rounded border transition-colors ${logFilter === filter ? activeStyle : 'bg-slate-800/40 text-slate-400 border-slate-800/80 hover:bg-slate-800 hover:text-slate-200'}`}
+                      >
+                        {label}
+                      </button>
+                    );
+                  })}
+                </div>
+              </div>
+
+              {/* Log Scroll Box */}
+              <div 
+                ref={logScrollRef}
+                className="flex-1 p-3 overflow-y-auto space-y-1.5 font-mono text-[11px] leading-relaxed max-h-[300px] h-[300px] bg-slate-950/95"
+              >
+                {solverLogs.length === 0 ? (
+                  <div className="text-slate-500 italic h-full flex items-center justify-center">
+                    Ready. Click 'Start Optimization' to watch decision traces...
+                  </div>
+                ) : (
+                  (() => {
+                    // Filter logs based on selection
+                    const filtered = solverLogs.filter(log => {
+                      if (logFilter === 'all') return true;
+                      if (logFilter === 'improvements') {
+                        return log.includes('[NEW BEST]') || log.includes('[SUCCESS]') || log.includes('0.1%') || log.includes('Initial solution') || log.includes('started') || log.includes('results');
+                      }
+                      if (logFilter === 'llm') {
+                        return log.includes('[LLM:') || log.includes('[HEURISTIC:') || log.includes('Ollama') || log.includes('Heuristic') || log.includes('Bypassing') || log.includes('Attempt');
+                      }
+                      if (logFilter === 'lns') {
+                        return log.includes('[LNS:') || log.includes('[SA:') || log.includes('Simulated Annealing') || log.includes('Candidate');
+                      }
+                      return true;
+                    });
+
+                    if (filtered.length === 0) {
+                      return <div className="text-slate-600 italic text-center pt-8">No logs match this filter.</div>;
+                    }
+
+                    return filtered.map((log, index) => {
+                      // Attempt to parse category: e.g. [LNS:CHOOSE] Message
+                      const categoryMatch = log.match(/^\[(.*?)\] (.*)$/);
+                      if (categoryMatch) {
+                        const category = categoryMatch[1];
+                        const text = categoryMatch[2];
+
+                        // Style category badge
+                        let badgeStyle = "bg-slate-800 text-slate-400 border-slate-700";
+                        let textStyle = "text-slate-300";
+
+                        if (category === 'LNS:CHOOSE') {
+                          badgeStyle = "bg-slate-900 text-slate-500 border-slate-800";
+                          textStyle = "text-slate-400";
+                        } else if (category === 'LNS:ACCEPT') {
+                          badgeStyle = "bg-emerald-950 text-emerald-400 border-emerald-900";
+                          textStyle = "text-slate-300";
+                        } else if (category === 'LNS:REJECT') {
+                          badgeStyle = "bg-slate-900 text-slate-600 border-slate-900";
+                          textStyle = "text-slate-500";
+                        } else if (category === 'LNS:DECISION') {
+                          if (text.includes('[NEW BEST]')) {
+                            badgeStyle = "bg-emerald-500 text-white font-bold border-emerald-400";
+                            textStyle = "text-emerald-300 font-bold";
+                          } else {
+                            badgeStyle = "bg-emerald-900 text-emerald-300 border-emerald-800";
+                            textStyle = "text-slate-300";
+                          }
+                        } else if (category === 'SA:DECISION') {
+                          badgeStyle = "bg-amber-950 text-amber-400 border-amber-900";
+                          textStyle = "text-amber-200/95";
+                        } else if (category === 'LLM:TRIGGER' || category === 'HEURISTIC:TRIGGER') {
+                          badgeStyle = "bg-violet-950 text-violet-400 border-violet-900";
+                          textStyle = "text-violet-300";
+                        } else if (category === 'LLM:DECISION' || category === 'HEURISTIC:DECISION') {
+                          badgeStyle = "bg-violet-900 text-violet-200 border-violet-800";
+                          textStyle = "text-violet-100 font-semibold";
+                        } else if (category === 'LLM:SUB-SOLVER' || category === 'HEURISTIC:SUB-SOLVER') {
+                          badgeStyle = "bg-indigo-950 text-indigo-400 border-indigo-900";
+                          textStyle = "text-slate-300";
+                        } else if (category === 'LLM:MERGE' || category === 'HEURISTIC:MERGE') {
+                          badgeStyle = "bg-blue-950 text-blue-400 border-blue-950";
+                          textStyle = "text-slate-400";
+                        } else if (category === 'LLM:SUCCESS' || category === 'HEURISTIC:SUCCESS') {
+                          badgeStyle = "bg-emerald-500 text-white font-bold border-emerald-400";
+                          textStyle = "text-emerald-300 font-bold animate-pulse";
+                        } else if (category === 'LLM:FAILURE' || category === 'HEURISTIC:FAILURE') {
+                          badgeStyle = "bg-rose-950 text-rose-400 border-rose-900";
+                          textStyle = "text-rose-300/80";
+                        }
+
+                        return (
+                          <div key={index} className="flex items-start gap-1.5 hover:bg-slate-900/50 py-0.5 px-1 rounded transition-colors">
+                            <span className={`px-1.5 py-0.5 rounded text-[9px] uppercase tracking-wider border font-bold ${badgeStyle}`}>
+                              {category}
+                            </span>
+                            <span className={textStyle}>{text}</span>
+                          </div>
+                        );
+                      }
+
+                      // Default fallbacks (errors, starts)
+                      const isError = log.toLowerCase().includes('error');
+                      const isOllama = log.includes('Ollama') || log.includes('LLM');
+                      const defaultClass = isError
+                        ? 'text-red-400 font-bold'
+                        : isOllama
+                          ? 'text-violet-300 font-medium'
+                          : 'text-slate-400';
+
+                      return (
+                        <div key={index} className={`flex items-start space-x-1.5 py-0.5 px-1 ${defaultClass}`}>
+                          <span className="text-slate-600">›</span>
+                          <span>{log}</span>
+                        </div>
+                      );
+                    });
+                  })()
+                )}
+              </div>
+            </div>
+
+            {/* Best Solution metrics */}
+            {solution && (
+              <div className="grid grid-cols-2 gap-3 mb-4">
+                <div className="bg-slate-50 rounded-lg p-2.5 border border-slate-100">
+                  <span className="block text-[10px] font-bold uppercase text-slate-400">Vehicles Used</span>
+                  <span className="text-lg font-bold text-slate-800 flex items-center space-x-1.5">
+                    <Truck className="h-4 w-4 text-slate-500" />
+                    <span>{solution.totalVehicles}</span>
+                  </span>
+                </div>
+                <div className="bg-slate-50 rounded-lg p-2.5 border border-slate-100">
+                  <span className="block text-[10px] font-bold uppercase text-slate-400">Best Distance</span>
+                  <span className="text-lg font-bold text-slate-800 flex items-center space-x-1.5">
+                    <TrendingDown className="h-4 w-4 text-slate-500" />
+                    <span>{solution.totalDistance.toFixed(2)}</span>
+                  </span>
+                </div>
+              </div>
+            )}
+
+            {/* Custom SVG Sparkline for Convergence history */}
+            {progressHistory.length > 1 && (
+              <div className="flex-1 flex flex-col min-h-[180px]">
+                <span className="text-[10px] font-bold uppercase tracking-wider text-slate-400 mb-2 flex items-center justify-between">
+                  <span>Convergence Curve</span>
+                  <span className="font-normal text-slate-500">Distance vs Iteration</span>
+                </span>
+                <div className="flex-1 bg-slate-50/50 rounded-lg border border-slate-200 relative p-3 min-h-[140px] flex items-center justify-center">
+                  <svg className="w-full h-full max-h-[160px]" viewBox="0 0 240 120" id="svg-convergence-curve">
+                    {(() => {
+                      const maxDist = Math.max(...progressHistory.map(p => p.distance));
+                      const minDist = Math.min(...progressHistory.map(p => p.distance));
+                      const distDiff = maxDist - minDist || 1;
+                      const iterMax = Math.max(...progressHistory.map(p => p.iteration)) || 1;
+                      const iterMin = Math.min(...progressHistory.map(p => p.iteration)) || 0;
+                      const iterDiff = iterMax - iterMin || 1;
+
+                      const points = progressHistory.map((p) => {
+                        const x = 38 + ((p.iteration - iterMin) / iterDiff) * 187;
+                        const y = 95 - ((p.distance - minDist) / distDiff) * 80;
+                        return `${x.toFixed(1)},${y.toFixed(1)}`;
+                      }).join(' ');
+
+                      const startY = 95 - ((progressHistory[0].distance - minDist) / distDiff) * 80;
+                      const endY = 95 - ((progressHistory[progressHistory.length - 1].distance - minDist) / distDiff) * 80;
+
+                      return (
+                        <>
+                          {/* Grid lines */}
+                          <line x1="38" y1="15" x2="225" y2="15" stroke="#f1f5f9" strokeWidth="1" strokeDasharray="2,2" />
+                          <line x1="38" y1="55" x2="225" y2="55" stroke="#f1f5f9" strokeWidth="1" strokeDasharray="2,2" />
+                          <line x1="131.5" y1="15" x2="131.5" y2="95" stroke="#f1f5f9" strokeWidth="1" strokeDasharray="2,2" />
+
+                          {/* Axes */}
+                          <line x1="38" y1="15" x2="38" y2="95" stroke="#cbd5e1" strokeWidth="1" />
+                          <line x1="38" y1="95" x2="225" y2="95" stroke="#cbd5e1" strokeWidth="1" />
+
+                          {/* Y-Ticks */}
+                          <line x1="34" y1="15" x2="38" y2="15" stroke="#cbd5e1" strokeWidth="1" />
+                          <line x1="34" y1="55" x2="38" y2="55" stroke="#cbd5e1" strokeWidth="1" />
+                          <line x1="34" y1="95" x2="38" y2="95" stroke="#cbd5e1" strokeWidth="1" />
+
+                          {/* Y-labels */}
+                          <text x="31" y="18" textAnchor="end" className="text-[7.5px] fill-slate-500 font-mono font-medium">{maxDist.toFixed(1)}</text>
+                          <text x="31" y="58" textAnchor="end" className="text-[7.5px] fill-slate-500 font-mono font-medium">{(minDist + distDiff * 0.5).toFixed(1)}</text>
+                          <text x="31" y="98" textAnchor="end" className="text-[7.5px] fill-slate-600 font-mono font-bold">{minDist.toFixed(1)}</text>
+
+                          {/* X-Ticks */}
+                          <line x1="38" y1="95" x2="38" y2="99" stroke="#cbd5e1" strokeWidth="1" />
+                          <line x1="131.5" y1="95" x2="131.5" y2="99" stroke="#cbd5e1" strokeWidth="1" />
+                          <line x1="225" y1="95" x2="225" y2="99" stroke="#cbd5e1" strokeWidth="1" />
+
+                          {/* X-labels */}
+                          <text x="38" y="107" textAnchor="middle" className="text-[7.5px] fill-slate-500 font-mono font-medium">{iterMin}</text>
+                          <text x="131.5" y="107" textAnchor="middle" className="text-[7.5px] fill-slate-500 font-mono font-medium">{Math.round(iterMin + iterDiff * 0.5)}</text>
+                          <text x="225" y="107" textAnchor="middle" className="text-[7.5px] fill-slate-500 font-mono font-medium">{iterMax}</text>
+
+                          {/* Axis Titles */}
+                          <text transform="translate(10, 55) rotate(-90)" textAnchor="middle" className="text-[7.5px] font-bold uppercase tracking-wider fill-slate-400">Distance</text>
+                          <text x="131.5" y="117" textAnchor="middle" className="text-[7.5px] font-bold uppercase tracking-wider fill-slate-400">Iteration</text>
+
+                          {/* Thinner line */}
+                          <polyline
+                            fill="none"
+                            stroke="#3b82f6"
+                            strokeWidth="1.2"
+                            points={points}
+                          />
+
+                          {/* Starting and ending dots */}
+                          <circle cx="38" cy={startY} r="2" fill="#ef4444" />
+                          <circle cx="225" cy={endY} r="2" fill="#10b981" />
+                        </>
+                      );
+                    })()}
+                  </svg>
+                </div>
+              </div>
+            )}
+          </div>
         </div>
       </div>
 
