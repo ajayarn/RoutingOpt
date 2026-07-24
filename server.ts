@@ -178,6 +178,7 @@ app.get('/api/solve-stream', async (req, res) => {
   const llmThreshold = req.query.llmThreshold ? parseInt(req.query.llmThreshold as string, 10) : 20;
   const optimal = req.query.optimal ? parseFloat(req.query.optimal as string) : undefined;
   const useLlm = req.query.useLlm === 'true';
+  const useLkh = req.query.useLkh === 'true';
 
   if (!instanceId) {
     res.status(400).json({ error: 'Instance ID is required' });
@@ -203,7 +204,8 @@ app.get('/api/solve-stream', async (req, res) => {
     '-algorithm', algorithm,
     '-llm-threshold', String(llmThreshold),
     '-seed', String(Date.now()),
-    `-use-llm=${useLlm}`
+    `-use-llm=${useLlm}`,
+    `-use-lkh=${useLkh}`
   ];
   if (optimal !== undefined && !isNaN(optimal)) {
     args.push('-optimal', String(optimal));

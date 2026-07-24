@@ -10,6 +10,8 @@ import (
 	"math/rand"
 	"net/http"
 	"os"
+	"os/exec"
+	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
@@ -70,6 +72,7 @@ func main() {
 	optimal := flag.Float64("optimal", 0.0, "Optimal distance for early stopping")
 	llmThreshold := flag.Int("llm-threshold", 20, "Iteration threshold for LLM intervention")
 	useLLM := flag.Bool("use-llm", false, "Use Ollama LLM via /api/llm-destroy instead of the pure-Go heuristic for stagnation destroy selection")
+	useLKH := flag.Bool("use-lkh", false, "Use the native LKH3 binary instead of the pure-Go K-means+LNS sub-solver for stagnation sub-solving")
 	flag.Parse()
 
 	if *filePath == "" {
@@ -224,16 +227,10 @@ func main() {
 			originalBestSol := cloneSolution(bestSol)
 
 			for attempt := 1; attempt <= maxAttempts; attempt++ {
-				// Gradually increase destruction size from 2-3 routes to 4-5 routes if we can't improve
+				// Kept at a fixed 2-3 routes across all attempts (no escalation to
+				// 4-5) to keep subproblem sizes manageable for the LKH3 sub-solver.
 				minDestroyRoutes := 2
 				maxDestroyRoutes := 3
-				if attempt == 2 {
-					minDestroyRoutes = 3
-					maxDestroyRoutes = 4
-				} else if attempt >= 3 {
-					minDestroyRoutes = 4
-					maxDestroyRoutes = 5
-				}
 
 				// Cap destruction sizes by actual number of routes
 				numRoutes := len(bestSol.Routes)
@@ -326,55 +323,78 @@ func main() {
 					}
 					
 					if len(destroyedCustomers) > 0 {
-						sendProgressLog(iter, bestSol, startTime, "HEURISTIC:SUB-SOLVER", "Attempt %d: Re-routing %d removed customers. Phase 1: K-Means Clustering -> Initial Sequence Insertion...", attempt, len(destroyedCustomers))
-						
-						// Re-solve with our approach: Clustering -> Initial solution -> LNS (run on the subset)
-						subSol := buildInitialSolution(destroyedCustomers, depot, capacity, customerMap)
-						sendProgressLog(iter, bestSol, startTime, "HEURISTIC:SUB-SOLVER", "Phase 1 Complete. Initial subproblem routing: %d vehicles, %.2f distance.", subSol.TotalVehicles, subSol.TotalDistance)
-						
-						if len(subSol.Routes) > 0 {
-							numSubCust := len(destroyedCustomers)
-							minSubDestroy := int(math.Max(1, float64(numSubCust)*0.10))
-							maxSubDestroy := int(math.Max(2, float64(numSubCust)*0.40))
-							if maxSubDestroy < minSubDestroy {
-								maxSubDestroy = minSubDestroy
+						var subSol Solution
+						pureGoStart := time.Now()
+
+						{
+							sendProgressLog(iter, bestSol, startTime, "HEURISTIC:SUB-SOLVER", "Attempt %d: Re-routing %d removed customers. Phase 1: K-Means Clustering -> Initial Sequence Insertion...", attempt, len(destroyedCustomers))
+
+							// Re-solve with our approach: Clustering -> Initial solution -> LNS (run on the subset)
+							subSol = buildInitialSolution(destroyedCustomers, depot, capacity, customerMap)
+							sendProgressLog(iter, bestSol, startTime, "HEURISTIC:SUB-SOLVER", "Phase 1 Complete. Initial subproblem routing: %d vehicles, %.2f distance.", subSol.TotalVehicles, subSol.TotalDistance)
+
+							if len(subSol.Routes) > 0 {
+								numSubCust := len(destroyedCustomers)
+								minSubDestroy := int(math.Max(1, float64(numSubCust)*0.10))
+								maxSubDestroy := int(math.Max(2, float64(numSubCust)*0.40))
+								if maxSubDestroy < minSubDestroy {
+									maxSubDestroy = minSubDestroy
+								}
+
+								sendProgressLog(iter, bestSol, startTime, "HEURISTIC:SUB-SOLVER", "Phase 2: Optimizing subproblem routing using LNS on subset for 50 sub-iterations (destroying %d-%d customers per sub-iter)...", minSubDestroy, maxSubDestroy)
+								// Run LNS on this sub-solution for 50 sub-iterations
+								subImprovements := 0
+								for subIter := 1; subIter <= 50; subIter++ {
+									currentSubSol := cloneSolution(subSol)
+									subK := minSubDestroy
+									if maxSubDestroy > minSubDestroy {
+										subK = rand.Intn(maxSubDestroy-minSubDestroy+1) + minSubDestroy
+									}
+
+									var subRemoved []int
+									var partialSubSol Solution
+									if rand.Float64() < 0.5 {
+										partialSubSol, subRemoved = destroyWorst(currentSubSol, subK, customerMap, depot)
+									} else {
+										partialSubSol, subRemoved = destroyRandom(currentSubSol, subK, customerMap, depot)
+									}
+
+									candidateSubSol := repairGreedy(partialSubSol, subRemoved, customerMap, depot, capacity)
+
+									acceptSub := false
+									if candidateSubSol.TotalVehicles < subSol.TotalVehicles {
+										acceptSub = true
+									} else if candidateSubSol.TotalVehicles == subSol.TotalVehicles && candidateSubSol.TotalDistance < subSol.TotalDistance {
+										acceptSub = true
+									}
+
+									if acceptSub {
+										subSol = candidateSubSol
+										subImprovements++
+									}
+								}
+								sendProgressLog(iter, bestSol, startTime, "HEURISTIC:SUB-SOLVER", "Phase 2 Complete. Subset LNS performed %d improvements. Final subset routing: %d vehicles, %.2f distance.", subImprovements, subSol.TotalVehicles, subSol.TotalDistance)
 							}
-							
-							sendProgressLog(iter, bestSol, startTime, "HEURISTIC:SUB-SOLVER", "Phase 2: Optimizing subproblem routing using LNS on subset for 50 sub-iterations (destroying %d-%d customers per sub-iter)...", minSubDestroy, maxSubDestroy)
-							// Run LNS on this sub-solution for 50 sub-iterations
-							subImprovements := 0
-							for subIter := 1; subIter <= 50; subIter++ {
-								currentSubSol := cloneSolution(subSol)
-								subK := minSubDestroy
-								if maxSubDestroy > minSubDestroy {
-									subK = rand.Intn(maxSubDestroy-minSubDestroy+1) + minSubDestroy
-								}
-								
-								var subRemoved []int
-								var partialSubSol Solution
-								if rand.Float64() < 0.5 {
-									partialSubSol, subRemoved = destroyWorst(currentSubSol, subK, customerMap, depot)
-								} else {
-									partialSubSol, subRemoved = destroyRandom(currentSubSol, subK, customerMap, depot)
-								}
-								
-								candidateSubSol := repairGreedy(partialSubSol, subRemoved, customerMap, depot, capacity)
-								
-								acceptSub := false
-								if candidateSubSol.TotalVehicles < subSol.TotalVehicles {
-									acceptSub = true
-								} else if candidateSubSol.TotalVehicles == subSol.TotalVehicles && candidateSubSol.TotalDistance < subSol.TotalDistance {
-									acceptSub = true
-								}
-								
-								if acceptSub {
-									subSol = candidateSubSol
-									subImprovements++
-								}
-							}
-							sendProgressLog(iter, bestSol, startTime, "HEURISTIC:SUB-SOLVER", "Phase 2 Complete. Subset LNS performed %d improvements. Final subset routing: %d vehicles, %.2f distance.", subImprovements, subSol.TotalVehicles, subSol.TotalDistance)
 						}
-						
+						pureGoElapsed := time.Since(pureGoStart)
+
+						if *useLKH {
+							sendProgressLog(iter, bestSol, startTime, "LKH:TRIGGER", "Invoking LKH3 on %d removed customers (vehicles cap = %d, no timeout)...", len(destroyedCustomers), len(finalDestroyIDs))
+							lkhStart := time.Now()
+							lkhSol := invokeLKHSubSolver(destroyedCustomers, depot, capacity, customerMap, len(finalDestroyIDs))
+							lkhElapsed := time.Since(lkhStart)
+
+							if lkhSol != nil {
+								sendProgressLog(iter, bestSol, startTime, "LKH:COMPARE", "size=%d customers, %d vehicles cap | LKH3: %d vehicles, %.2f distance, took %v | Pure-Go: %d vehicles, %.2f distance, took %v", len(destroyedCustomers), len(finalDestroyIDs), lkhSol.TotalVehicles, lkhSol.TotalDistance, lkhElapsed, subSol.TotalVehicles, subSol.TotalDistance, pureGoElapsed)
+								if lkhSol.TotalVehicles < subSol.TotalVehicles || (lkhSol.TotalVehicles == subSol.TotalVehicles && lkhSol.TotalDistance < subSol.TotalDistance) {
+									subSol = *lkhSol
+									sendProgressLog(iter, bestSol, startTime, "LKH:SUCCESS", "LKH3 sub-solve used (size=%d customers): %d vehicles, %.2f distance, took %v.", len(destroyedCustomers), subSol.TotalVehicles, subSol.TotalDistance, lkhElapsed)
+								}
+							} else {
+								sendProgressLog(iter, bestSol, startTime, "LKH:FALLBACK", "LKH3 sub-solve failed or returned an infeasible result (size=%d customers, took %v); using the pure-Go sub-solver result.", len(destroyedCustomers), lkhElapsed)
+							}
+						}
+
 						// Merge back
 						var mergedRoutes []Route
 						for _, r := range untouchedRoutes {
@@ -1288,6 +1308,192 @@ func selectStagnationRoutesHeuristically(
 
 	// Fallback
 	return getClosestRoutes(rand.Intn(numRoutes), countToDestroy)
+}
+
+// invokeLKHSubSolver re-solves a set of destroyed customers using the native LKH3
+// binary (lkh_bin) instead of the pure-Go K-means+LNS sub-solver. LKH3 handles
+// CVRPTW via a soft violation-penalty model, not hard constraints, so its output
+// is never trusted directly: every returned route is re-validated (and its
+// timing/load fields repopulated) through calculateRouteDetails, the same
+// feasibility function every other insertion/repair decision in this file uses.
+// Returns nil on any failure (binary missing, timeout, parse error, reported
+// violation, or a route that fails re-validation) so the caller can fall back to
+// the existing sub-solver unchanged.
+func invokeLKHSubSolver(destroyedCustomers []Customer, depot Customer, capacity float64, customerMap map[int]Customer, maxVehicles int) *Solution {
+	n := len(destroyedCustomers)
+	if n == 0 {
+		return nil
+	}
+
+	// LKH node IDs are 1-indexed with node 1 reserved for the depot.
+	// idOf[k-1] maps LKH node k back to the real Customer.ID.
+	idOf := make([]int, n+1)
+	idOf[0] = depot.ID
+	for i, c := range destroyedCustomers {
+		idOf[i+1] = c.ID
+	}
+
+	// Unlike the pure-Go sub-solver (which can always open another route when a
+	// cluster doesn't fit), LKH3's VEHICLES is a hard cap - it must partition
+	// customers into exactly that many routes, modeled internally as a TSP over
+	// N + (VEHICLES-1) *coincident* depot copies. Setting this to n (one per
+	// customer) was tried and measured ~75x slower overall (degenerate
+	// alpha-nearness candidate generation over many zero-distance depot copies)
+	// with no quality gain. maxVehicles should instead be the number of routes
+	// destroyed to produce this subproblem - a feasible maxVehicles-route cover
+	// is already known to exist (bestSol had one moments earlier), so this both
+	// avoids the artificial-infeasibility problem a capacity-only estimate had
+	// and keeps the internal graph small. LKH reports any genuinely-unneeded
+	// vehicles as trivial empty depot-to-depot routes (filtered out below).
+	vehicles := maxVehicles
+	if vehicles < 1 {
+		vehicles = 1
+	}
+	if vehicles > n {
+		vehicles = n
+	}
+
+	tmpDir, err := os.MkdirTemp("", "lkh_sub_*")
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "LKH: failed to create temp dir: %v\n", err)
+		return nil
+	}
+	defer os.RemoveAll(tmpDir)
+
+	instancePath := filepath.Join(tmpDir, "sub.vrptw")
+	parPath := filepath.Join(tmpDir, "sub.par")
+	solPath := filepath.Join(tmpDir, "sub.sol")
+
+	var instance strings.Builder
+	fmt.Fprintf(&instance, "NAME : sub\n")
+	fmt.Fprintf(&instance, "TYPE : CVRPTW\n")
+	fmt.Fprintf(&instance, "DIMENSION : %d\n", n+1)
+	fmt.Fprintf(&instance, "VEHICLES : %d\n", vehicles)
+	fmt.Fprintf(&instance, "CAPACITY : %d\n", int(math.Round(capacity)))
+	fmt.Fprintf(&instance, "EDGE_WEIGHT_TYPE : EXACT_2D\n")
+
+	fmt.Fprintf(&instance, "NODE_COORD_SECTION\n")
+	fmt.Fprintf(&instance, "1 %.6f %.6f\n", depot.X, depot.Y)
+	for i, c := range destroyedCustomers {
+		fmt.Fprintf(&instance, "%d %.6f %.6f\n", i+2, c.X, c.Y)
+	}
+
+	fmt.Fprintf(&instance, "DEMAND_SECTION\n")
+	fmt.Fprintf(&instance, "1 0\n")
+	for i, c := range destroyedCustomers {
+		fmt.Fprintf(&instance, "%d %d\n", i+2, int(math.Round(c.Demand)))
+	}
+
+	// This LKH3 build only recognizes a single scalar SERVICE_TIME for the whole
+	// instance (SERVICE_TIME_SECTION is not registered as a top-level keyword in
+	// ReadProblem here) - safe because Solomon/Homberger instances use a uniform
+	// per-customer service time (verified against data/rc201.txt: only 0/depot
+	// and one shared nonzero value occur).
+	fmt.Fprintf(&instance, "SERVICE_TIME : %.6f\n", destroyedCustomers[0].ServiceTime)
+
+	// 6 fields per row: id, earliest, latest, then 3 pickup-delivery fields this
+	// parser always consumes regardless of problem type (unused here, hence 0 0 0).
+	fmt.Fprintf(&instance, "TIME_WINDOW_SECTION\n")
+	fmt.Fprintf(&instance, "1 %.6f %.6f 0 0 0\n", depot.ReadyTime, depot.DueDate)
+	for i, c := range destroyedCustomers {
+		fmt.Fprintf(&instance, "%d %.6f %.6f 0 0 0\n", i+2, c.ReadyTime, c.DueDate)
+	}
+
+	fmt.Fprintf(&instance, "DEPOT_SECTION\n1\n-1\nEOF\n")
+
+	if err := os.WriteFile(instancePath, []byte(instance.String()), 0644); err != nil {
+		fmt.Fprintf(os.Stderr, "LKH: failed to write instance file: %v\n", err)
+		return nil
+	}
+
+	par := fmt.Sprintf(
+		"PROBLEM_FILE = %s\nMTSP_SOLUTION_FILE = %s\nMAX_TRIALS = 200\nRUNS = 1\nTRACE_LEVEL = 0\nSEED = %d\n",
+		instancePath, solPath, rand.Int63n(1<<31),
+	)
+	if err := os.WriteFile(parPath, []byte(par), 0644); err != nil {
+		fmt.Fprintf(os.Stderr, "LKH: failed to write parameter file: %v\n", err)
+		return nil
+	}
+
+	// No timeout: LKH's value is expected to matter most on the larger
+	// subproblems, which need more search time - let it run to completion
+	// (MAX_TRIALS/RUNS below still bound the search itself).
+	cmd := exec.Command("./lkh_bin", parPath)
+	if err := cmd.Run(); err != nil {
+		fmt.Fprintf(os.Stderr, "LKH: invocation failed (n=%d, vehicles=%d): %v\n", n, vehicles, err)
+		return nil
+	}
+
+	solData, err := os.ReadFile(solPath)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "LKH: failed to read solution file (n=%d, vehicles=%d): %v\n", n, vehicles, err)
+		return nil
+	}
+
+	lines := strings.Split(strings.TrimSpace(string(solData)), "\n")
+	if len(lines) < 2 {
+		return nil
+	}
+
+	// First line: "<name>, Cost: <violation>_<cost>" - a nonzero violation means
+	// LKH's soft penalty model did not find a fully time-window/capacity-feasible
+	// tour, so the whole result is discarded rather than trusted.
+	costIdx := strings.Index(lines[0], "Cost:")
+	if costIdx == -1 {
+		return nil
+	}
+	costParts := strings.SplitN(strings.TrimSpace(lines[0][costIdx+len("Cost:"):]), "_", 2)
+	if len(costParts) != 2 {
+		return nil
+	}
+	violation, err := strconv.ParseFloat(costParts[0], 64)
+	if err != nil || violation != 0 {
+		return nil
+	}
+
+	var routes []Route
+	for _, line := range lines[1:] {
+		line = strings.TrimSpace(line)
+		parenIdx := strings.Index(line, "(")
+		if line == "" || parenIdx == -1 {
+			continue
+		}
+
+		var custIDs []int
+		for _, tok := range strings.Fields(line[:parenIdx]) {
+			nodeID, err := strconv.Atoi(tok)
+			if err != nil || nodeID == 1 {
+				continue // parse error or depot bookend
+			}
+			if nodeID-1 < 1 || nodeID-1 >= len(idOf) {
+				continue
+			}
+			custIDs = append(custIDs, idOf[nodeID-1])
+		}
+		if len(custIDs) == 0 {
+			continue // unused vehicle, reported as an empty depot-to-depot route
+		}
+
+		rDetails, feasible := calculateRouteDetails(custIDs, customerMap, depot, capacity)
+		if !feasible {
+			// LKH reported zero violation under its own (scaled/penalty) model but
+			// this route fails the solver's own ground-truth feasibility check -
+			// reject the whole result rather than merge a partially-trusted one.
+			return nil
+		}
+		routes = append(routes, rDetails)
+	}
+
+	if len(routes) == 0 {
+		return nil
+	}
+	for idx := range routes {
+		routes[idx].VehicleID = idx + 1
+	}
+
+	subSol := Solution{Routes: routes}
+	recalculateSolutionMetrics(&subSol)
+	return &subSol
 }
 
 func invokeLLMToSelectTrucks(bestSol Solution, instanceName string, history []DestructionAttempt, minDestroy, maxDestroy int) []int {

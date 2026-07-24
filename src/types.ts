@@ -43,6 +43,7 @@ export interface SolverParams {
   destroyRate?: number;
   llmThreshold?: number;
   useLlm?: boolean;
+  useLkh?: boolean;
 }
 
 export interface SolverProgressMessage {

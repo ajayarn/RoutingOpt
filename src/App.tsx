@@ -68,7 +68,8 @@ export default function App() {
     algorithm: 'lns',
     maxIterations: 1000,
     llmThreshold: 20,
-    useLlm: false
+    useLlm: false,
+    useLkh: false
   });
 
   // Data states
@@ -223,7 +224,8 @@ export default function App() {
     const optimalParam = optimalObj ? `&optimal=${optimalObj.distance}` : '';
     const llmParam = params.llmThreshold ? `&llmThreshold=${params.llmThreshold}` : '';
     const useLlmParam = `&useLlm=${params.useLlm ? 'true' : 'false'}`;
-    const url = `/api/solve-stream?instance=${selectedInstanceId}&iterations=${params.maxIterations}&algorithm=${params.algorithm}${optimalParam}${llmParam}${useLlmParam}`;
+    const useLkhParam = `&useLkh=${params.useLkh ? 'true' : 'false'}`;
+    const url = `/api/solve-stream?instance=${selectedInstanceId}&iterations=${params.maxIterations}&algorithm=${params.algorithm}${optimalParam}${llmParam}${useLlmParam}${useLkhParam}`;
     const es = new EventSource(url);
     eventSourceRef.current = es;
 
@@ -534,14 +536,9 @@ export default function App() {
 
               {/* Ollama LLM destroy switch */}
               <div className="flex items-center justify-between mt-4 pt-4 border-t border-slate-100">
-                <div>
-                  <label className="block text-xs font-semibold text-slate-600" htmlFor="use-llm-toggle">
-                    Use Ollama LLM for destroy selection
-                  </label>
-                  <p className="text-[11px] text-slate-400 mt-0.5 leading-normal max-w-[220px]">
-                    Off (default): the Go solver's own heuristic picks routes to destroy. On: a local Ollama LLM (gemma4:12b) is asked instead.
-                  </p>
-                </div>
+                <label className="text-xs font-semibold text-slate-600" htmlFor="use-llm-toggle">
+                  Use Ollama LLM for destroy selection
+                </label>
                 <button
                   id="use-llm-toggle"
                   type="button"
@@ -553,6 +550,26 @@ export default function App() {
                 >
                   <span
                     className={`inline-block h-3.5 w-3.5 transform rounded-full bg-white transition-transform ${params.useLlm ? 'translate-x-5' : 'translate-x-1'}`}
+                  />
+                </button>
+              </div>
+
+              {/* LKH3 stagnation sub-solver switch */}
+              <div className="flex items-center justify-between mt-3 pt-3 border-t border-slate-100">
+                <label className="text-xs font-semibold text-slate-600" htmlFor="use-lkh-toggle">
+                  Use LKH3 for stagnation sub-solving
+                </label>
+                <button
+                  id="use-lkh-toggle"
+                  type="button"
+                  role="switch"
+                  aria-checked={!!params.useLkh}
+                  disabled={isSolving}
+                  onClick={() => setParams(prev => ({ ...prev, useLkh: !prev.useLkh }))}
+                  className={`shrink-0 relative inline-flex h-5 w-9 items-center rounded-full transition-colors disabled:opacity-50 ${params.useLkh ? 'bg-blue-600' : 'bg-slate-300'}`}
+                >
+                  <span
+                    className={`inline-block h-3.5 w-3.5 transform rounded-full bg-white transition-transform ${params.useLkh ? 'translate-x-5' : 'translate-x-1'}`}
                   />
                 </button>
               </div>
@@ -1166,7 +1183,7 @@ export default function App() {
                         return log.includes('[NEW BEST]') || log.includes('[SUCCESS]') || log.includes('0.1%') || log.includes('Initial solution') || log.includes('started') || log.includes('results');
                       }
                       if (logFilter === 'llm') {
-                        return log.includes('[LLM:') || log.includes('[HEURISTIC:') || log.includes('Ollama') || log.includes('Heuristic') || log.includes('Bypassing') || log.includes('Attempt');
+                        return log.includes('[LLM:') || log.includes('[HEURISTIC:') || log.includes('[LKH:') || log.includes('Ollama') || log.includes('Heuristic') || log.includes('LKH') || log.includes('Bypassing') || log.includes('Attempt');
                       }
                       if (logFilter === 'lns') {
                         return log.includes('[LNS:') || log.includes('[SA:') || log.includes('Simulated Annealing') || log.includes('Candidate');
@@ -1227,6 +1244,18 @@ export default function App() {
                         } else if (category === 'LLM:FAILURE' || category === 'HEURISTIC:FAILURE') {
                           badgeStyle = "bg-rose-950 text-rose-400 border-rose-900";
                           textStyle = "text-rose-300/80";
+                        } else if (category === 'LKH:TRIGGER') {
+                          badgeStyle = "bg-cyan-950 text-cyan-400 border-cyan-900";
+                          textStyle = "text-cyan-300";
+                        } else if (category === 'LKH:COMPARE') {
+                          badgeStyle = "bg-cyan-900 text-cyan-200 border-cyan-800";
+                          textStyle = "text-slate-300";
+                        } else if (category === 'LKH:SUCCESS') {
+                          badgeStyle = "bg-emerald-500 text-white font-bold border-emerald-400";
+                          textStyle = "text-emerald-300 font-bold animate-pulse";
+                        } else if (category === 'LKH:FALLBACK') {
+                          badgeStyle = "bg-rose-950 text-rose-400 border-rose-900";
+                          textStyle = "text-rose-300/80";
                         }
 
                         return (
@@ -1241,7 +1270,7 @@ export default function App() {
 
                       // Default fallbacks (errors, starts)
                       const isError = log.toLowerCase().includes('error');
-                      const isOllama = log.includes('Ollama') || log.includes('LLM');
+                      const isOllama = log.includes('Ollama') || log.includes('LLM') || log.includes('LKH');
                       const defaultClass = isError
                         ? 'text-red-400 font-bold'
                         : isOllama
