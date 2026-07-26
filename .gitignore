@@ -7,3 +7,6 @@ coverage/
 .env*
 !.env.example
 lkh3src/OBJ/
+lkh3src/OBJ_WASM/
+lkh_wasm_build/
+tools/emsdk/
