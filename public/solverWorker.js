@@ -230,9 +230,6 @@ self.onmessage = async (event) => {
       "-seed", String(args.seed),
       `-use-lkh=${!!args.useLkh}`,
     ];
-    if (args.optimal !== undefined && args.optimal !== null) {
-      argv.push("-optimal", String(args.optimal));
-    }
     go.argv = argv;
 
     const resp = await fetch("wasm/solver.wasm");

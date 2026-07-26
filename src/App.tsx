@@ -124,6 +124,57 @@ export const OPTIMAL_SOLUTIONS: Record<string, { distance: number; vehicles: num
   }
 };
 
+// SINTEF rounds published best-known distances to 2 decimals, so the solver's full-precision
+// totalDistance must be rounded the same way before comparing - otherwise float noise below the
+// published value reads as a false tie/improvement. Vehicle count (the primary objective) is
+// compared first and dominates the verdict regardless of distance.
+function computeGapToOptimal(solution: SolverSolution, bks: { distance: number; vehicles: number }) {
+  if (solution.totalVehicles < bks.vehicles) {
+    return { text: `New best — fewer vehicles (${solution.totalVehicles} vs ${bks.vehicles})`, tone: 'good' as const };
+  }
+  if (solution.totalVehicles > bks.vehicles) {
+    return { text: `+${solution.totalVehicles - bks.vehicles} vehicle(s) vs best known`, tone: 'bad' as const };
+  }
+
+  const roundedDistance = Math.round(solution.totalDistance * 100) / 100;
+  const gapPct = ((roundedDistance - bks.distance) / bks.distance) * 100;
+  if (gapPct < 0) {
+    return { text: `${gapPct.toFixed(2)}% (beats best known!)`, tone: 'good' as const };
+  }
+  if (gapPct === 0) {
+    return { text: '0.00% (Optimal)', tone: 'good' as const };
+  }
+  return { text: `+${gapPct.toFixed(2)}%`, tone: 'bad' as const };
+}
+
+function formatExportTimestamp(date: Date): string {
+  const pad = (n: number) => String(n).padStart(2, '0');
+  return `${pad(date.getDate())}.${pad(date.getMonth() + 1)}.${date.getFullYear()} ${pad(date.getHours())}:${pad(date.getMinutes())}:${pad(date.getSeconds())}`;
+}
+
+// SINTEF detailed-solution file format (see e.g. the published c101 solution) - depot (customer
+// 0) is implicit and omitted from each route's customer list, matching Route.customerIds.
+function exportSolutionAsText(solution: SolverSolution, instanceId: string, instanceName: string) {
+  const lines = [
+    `Instance name : ${instanceName}`,
+    `Authors       : Ajay Arn (RoutingOpt)`,
+    `Date          : ${formatExportTimestamp(new Date())}`,
+    `Reference     : https://github.com/ajayarn/RoutingOpt`,
+    `Solution`,
+    ...solution.routes.map((route, idx) => `Route  ${idx + 1} : ${route.customerIds.join(' ')}`),
+  ];
+
+  const blob = new Blob([lines.join('\n') + '\n'], { type: 'text/plain' });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = `${instanceId}_solution.txt`;
+  document.body.appendChild(a);
+  a.click();
+  document.body.removeChild(a);
+  URL.revokeObjectURL(url);
+}
+
 export default function App() {
   // Solver parameters
   const [params, setParams] = useState<SolverParams>({
@@ -314,8 +365,6 @@ export default function App() {
 
     setActiveMessage('Initializing Go VRPTW Solver (WASM)...');
 
-    const optimalObj = BEST_KNOWN_SOLUTIONS[selectedInstanceId];
-
     // Relative path - resolves correctly whether served from the domain
     // root or a GitHub Pages project subpath.
     const worker = new Worker('solverWorker.js');
@@ -396,7 +445,6 @@ export default function App() {
       args: {
         iterations: params.maxIterations,
         llmThreshold: params.llmThreshold ?? 20,
-        optimal: optimalObj?.distance,
         useLkh: !!params.useLkh,
         seed: Date.now(),
       }
@@ -713,21 +761,17 @@ export default function App() {
                     <div>Distance: <span className="font-semibold text-slate-800">{BEST_KNOWN_SOLUTIONS[selectedInstanceId].distance}</span></div>
                     <div>Vehicles: <span className="font-semibold text-slate-800">{BEST_KNOWN_SOLUTIONS[selectedInstanceId].vehicles}</span></div>
                   </div>
-                  {solution && (
-                    <div className="mt-2 text-[10px] text-slate-500 flex justify-between items-center bg-slate-50/50 p-1.5 rounded border border-slate-100">
-                      <span>Gap to Optimal:</span>
-                      <span className={`font-mono font-bold ${
-                        solution.totalDistance <= BEST_KNOWN_SOLUTIONS[selectedInstanceId].distance
-                          ? 'text-green-600'
-                          : 'text-amber-600'
-                      }`}>
-                        {solution.totalDistance <= BEST_KNOWN_SOLUTIONS[selectedInstanceId].distance
-                          ? '0.00% (Optimal)'
-                          : `+${(((solution.totalDistance - BEST_KNOWN_SOLUTIONS[selectedInstanceId].distance) / BEST_KNOWN_SOLUTIONS[selectedInstanceId].distance) * 100).toFixed(2)}%`
-                        }
-                      </span>
-                    </div>
-                  )}
+                  {solution && (() => {
+                    const gap = computeGapToOptimal(solution, BEST_KNOWN_SOLUTIONS[selectedInstanceId]);
+                    return (
+                      <div className="mt-2 text-[10px] text-slate-500 flex justify-between items-center bg-slate-50/50 p-1.5 rounded border border-slate-100">
+                        <span>Gap to Optimal:</span>
+                        <span className={`font-mono font-bold ${gap.tone === 'good' ? 'text-green-600' : 'text-amber-600'}`}>
+                          {gap.text}
+                        </span>
+                      </div>
+                    );
+                  })()}
                   {OPTIMAL_SOLUTIONS[selectedInstanceId] && (
                     <button
                       id="btn-view-optimal-ref"
@@ -1370,6 +1414,17 @@ export default function App() {
                   </span>
                 </div>
               </div>
+            )}
+
+            {solution && (
+              <button
+                id="btn-export-solution"
+                onClick={() => exportSolutionAsText(solution, selectedInstanceId, instanceData?.name ?? selectedInstanceId)}
+                className="w-full flex items-center justify-center space-x-2 py-2 px-3 mb-4 text-sm font-medium text-slate-700 bg-white border border-slate-300 rounded-lg hover:bg-slate-50 transition-colors"
+              >
+                <FileText className="h-4 w-4" />
+                <span>Export Result</span>
+              </button>
             )}
 
             {/* Custom SVG Sparkline for Convergence history */}
