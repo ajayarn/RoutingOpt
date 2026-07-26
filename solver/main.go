@@ -66,7 +66,6 @@ func main() {
 	filePath := flag.String("file", "", "Path to the Solomon instance file")
 	iterations := flag.Int("iterations", 1000, "Number of LNS iterations")
 	seed := flag.Int64("seed", 42, "Random seed")
-	optimal := flag.Float64("optimal", 0.0, "Optimal distance for early stopping")
 	llmThreshold := flag.Int("llm-threshold", 20, "Iteration threshold for LLM intervention")
 	useLLM := flag.Bool("use-llm", false, "Use Ollama LLM via /api/llm-destroy instead of the pure-Go heuristic for stagnation destroy selection")
 	useLKH := flag.Bool("use-lkh", false, "Use the native LKH3 binary instead of the pure-Go K-means+LNS sub-solver for stagnation sub-solving")
@@ -108,11 +107,6 @@ func main() {
 	sendProgress(0, sol, startTime)
 
 	bestSol := cloneSolution(sol)
-
-	if *optimal > 0.0 && bestSol.TotalDistance <= (*optimal)*1.001 {
-		sendResultWithMessage(bestSol, startTime, fmt.Sprintf("Initial solution is within 0.1%% of optimal solution (%.2f).", *optimal))
-		return
-	}
 
 	// Determine destroy sizes
 	numCustomers := len(customers)
@@ -180,13 +174,6 @@ func main() {
 			stagnationCounter = 0
 		} else {
 			stagnationCounter++
-		}
-
-		// Check early stopping
-		if *optimal > 0.0 && bestSol.TotalDistance <= (*optimal)*1.001 {
-			sendProgress(iter, bestSol, startTime)
-			sendResultWithMessage(bestSol, startTime, fmt.Sprintf("Reached 0.1%% of optimal solution (%.2f) at iteration %d.", *optimal, iter))
-			return
 		}
 
 		// Smart Heuristic stagnation-solver intervention when we are stuck (stagnated for *llmThreshold iterations)
