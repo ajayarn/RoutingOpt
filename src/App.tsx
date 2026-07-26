@@ -127,7 +127,6 @@ export const OPTIMAL_SOLUTIONS: Record<string, { distance: number; vehicles: num
 export default function App() {
   // Solver parameters
   const [params, setParams] = useState<SolverParams>({
-    algorithm: 'lns',
     maxIterations: 1000,
     llmThreshold: 20,
     useLkh: false
@@ -396,7 +395,6 @@ export default function App() {
       instanceText,
       args: {
         iterations: params.maxIterations,
-        algorithm: params.algorithm,
         llmThreshold: params.llmThreshold ?? 20,
         optimal: optimalObj?.distance,
         useLkh: !!params.useLkh,
@@ -546,7 +544,7 @@ export default function App() {
           </div>
           <div>
             <h1 className="text-xl font-bold tracking-tight text-slate-900" id="header-title">VRPTW Optimization Engine</h1>
-            <p className="text-xs text-slate-500 font-normal">Vehicle Routing Problem with Time Windows Solver utilizing LNS/SA metaheuristics with LLM-guided destroy operators</p>
+            <p className="text-xs text-slate-500 font-normal">Vehicle Routing Problem with Time Windows Solver utilizing LNS metaheuristics with LLM-guided destroy operators</p>
           </div>
         </div>
         <div className="flex items-center space-x-3">
@@ -581,21 +579,6 @@ export default function App() {
                 disabled={isSolving}
                 onChange={setSelectedInstanceId}
               />
-            </div>
-
-            {/* Algorithm selector */}
-            <div className="mb-4">
-              <label className="block text-xs font-semibold text-slate-600 mb-1.5" htmlFor="algorithm-select">Optimization Algorithm</label>
-              <select
-                id="algorithm-select"
-                value={params.algorithm}
-                disabled={isSolving}
-                onChange={(e) => setParams(prev => ({ ...prev, algorithm: e.target.value as any }))}
-                className="w-full text-sm border border-slate-300 rounded-lg p-2 bg-white focus:border-blue-500 focus:ring-1 focus:ring-blue-500 disabled:opacity-50"
-              >
-                <option value="lns">Large Neighborhood Search (LNS)</option>
-                <option value="sa">Simulated Annealing + LNS</option>
-              </select>
             </div>
 
             {/* Iterations input */}
@@ -1225,7 +1208,7 @@ export default function App() {
                       all: 'All',
                       improvements: '🏆 Improvements',
                       llm: '🧠 Smart Heuristic',
-                      lns: '⚡ LNS / SA',
+                      lns: '⚡ LNS',
                     }[filter];
 
                     const activeStyle = {
@@ -1269,7 +1252,7 @@ export default function App() {
                         return log.includes('[LLM:') || log.includes('[HEURISTIC:') || log.includes('[LKH:') || log.includes('Ollama') || log.includes('Heuristic') || log.includes('LKH') || log.includes('Bypassing') || log.includes('Attempt');
                       }
                       if (logFilter === 'lns') {
-                        return log.includes('[LNS:') || log.includes('[SA:') || log.includes('Simulated Annealing') || log.includes('Candidate');
+                        return log.includes('[LNS:') || log.includes('Candidate');
                       }
                       return true;
                     });
@@ -1306,9 +1289,6 @@ export default function App() {
                             badgeStyle = "bg-emerald-900 text-emerald-300 border-emerald-800";
                             textStyle = "text-slate-300";
                           }
-                        } else if (category === 'SA:DECISION') {
-                          badgeStyle = "bg-amber-950 text-amber-400 border-amber-900";
-                          textStyle = "text-amber-200/95";
                         } else if (category === 'LLM:TRIGGER' || category === 'HEURISTIC:TRIGGER') {
                           badgeStyle = "bg-violet-950 text-violet-400 border-violet-900";
                           textStyle = "text-violet-300";

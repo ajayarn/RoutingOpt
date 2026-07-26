@@ -65,7 +65,6 @@ func shouldTriggerStagnationSolver(stagnationCounter, llmThreshold, totalIterati
 func main() {
 	filePath := flag.String("file", "", "Path to the Solomon instance file")
 	iterations := flag.Int("iterations", 1000, "Number of LNS iterations")
-	algorithm := flag.String("algorithm", "lns", "Metaheuristic algorithm (lns, sa)")
 	seed := flag.Int64("seed", 42, "Random seed")
 	optimal := flag.Float64("optimal", 0.0, "Optimal distance for early stopping")
 	llmThreshold := flag.Int("llm-threshold", 20, "Iteration threshold for LLM intervention")
@@ -120,9 +119,6 @@ func main() {
 	minDestroy := int(math.Max(2, float64(numCustomers)*0.05))
 	maxDestroy := int(math.Max(5, float64(numCustomers)*0.30))
 
-	temperature := 100.0
-	coolingRate := 0.995
-
 	// Stagnation and adaptive LLM intervention tracking
 	stagnationCounter := 0
 
@@ -151,34 +147,18 @@ func main() {
 		// 3. Evaluate & Decide (Acceptance criterion)
 		accept := false
 		acceptReason := "candidate worse than current"
-		acceptCategory := "LNS:REJECT"
-		prob := 0.0
 
 		if candidateSol.TotalVehicles < sol.TotalVehicles {
 			accept = true
 			acceptReason = "reduced fleet size"
-			acceptCategory = "LNS:ACCEPT"
-		} else if candidateSol.TotalVehicles == sol.TotalVehicles {
-			if candidateSol.TotalDistance < sol.TotalDistance {
-				accept = true
-				acceptReason = "reduced route distance"
-				acceptCategory = "LNS:ACCEPT"
-			} else if *algorithm == "sa" {
-				// Simulated Annealing probability
-				delta := candidateSol.TotalDistance - sol.TotalDistance
-				prob = math.Exp(-delta / temperature)
-				if rand.Float64() < prob {
-					accept = true
-					acceptReason = "Simulated Annealing threshold met"
-					acceptCategory = "SA:DECISION"
-				}
-			}
+		} else if candidateSol.TotalVehicles == sol.TotalVehicles && candidateSol.TotalDistance < sol.TotalDistance {
+			accept = true
+			acceptReason = "reduced route distance"
 		}
 
 		if !accept && destroyType == "Random Destroy" {
 			accept = true
 			acceptReason = "always accept Random Destroy to escape local optima"
-			acceptCategory = "LNS:ACCEPT"
 		}
 
 		improvedThisIter := false
@@ -190,11 +170,7 @@ func main() {
 				bestSol = cloneSolution(sol)
 				sendProgressLog(iter, bestSol, startTime, "LNS:DECISION", "[NEW BEST] Found better global solution: %d vehicles, %.2f distance (Reason: %s)!", bestSol.TotalVehicles, bestSol.TotalDistance, acceptReason)
 			} else {
-				if acceptCategory == "SA:DECISION" {
-					sendProgressLog(iter, bestSol, startTime, "SA:DECISION", "[ACCEPTED] Worse candidate (prob: %.1f%%, Temp: %.1f): %d vehicles, %.2f distance vs current %.2f", prob*100, temperature, sol.TotalVehicles, sol.TotalDistance, currentSol.TotalDistance)
-				} else {
-					sendProgressLog(iter, bestSol, startTime, "LNS:ACCEPT", "[ACCEPTED] Candidate accepted: %d vehicles, %.2f distance (Reason: %s)", sol.TotalVehicles, sol.TotalDistance, acceptReason)
-				}
+				sendProgressLog(iter, bestSol, startTime, "LNS:ACCEPT", "[ACCEPTED] Candidate accepted: %d vehicles, %.2f distance (Reason: %s)", sol.TotalVehicles, sol.TotalDistance, acceptReason)
 			}
 		} else {
 			sendProgressLog(iter, bestSol, startTime, "LNS:REJECT", "[REJECTED] Candidate rejected: %d vehicles, %.2f distance vs current %.2f (Reason: %s)", candidateSol.TotalVehicles, candidateSol.TotalDistance, sol.TotalDistance, acceptReason)
@@ -441,9 +417,6 @@ func main() {
 				bestSol = cloneSolution(originalBestSol)
 			}
 		}
-
-		// Update SA temperature
-		temperature *= coolingRate
 
 		// Send progress updates
 		if iter%50 == 0 || iter == 1 || iter == *iterations {
