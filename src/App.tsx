@@ -18,6 +18,7 @@ import {
 } from 'lucide-react';
 import { Customer, VRPTWInstance, Route, SolverSolution, SolverParams, SolverProgressMessage } from './types';
 import InstanceCombobox from './InstanceCombobox';
+import { parseSolomonText } from './parseSolomon';
 
 // Standard 6 distinct high-contrast colors for routes
 const ROUTE_COLORS = [
@@ -155,6 +156,10 @@ export default function App() {
   const [uploadContent, setUploadContent] = useState('');
   const [uploadError, setUploadError] = useState('');
   const [isViewingOptimal, setIsViewingOptimal] = useState(false);
+  // Raw text of instances uploaded this session - there's no backend to
+  // persist these to (a static host has nowhere to write a file), so they
+  // only live in memory and are gone on refresh.
+  const [uploadedInstanceText, setUploadedInstanceText] = useState<Record<string, string>>({});
 
   const workerRef = useRef<Worker | null>(null);
   const timerRef = useRef<NodeJS.Timeout | null>(null);
@@ -203,24 +208,34 @@ export default function App() {
     }
   }, [solverLogs, logFilter]);
 
+  // No backend to ask for the instance list or a parsed instance (this app
+  // is a fully static site - GitHub Pages, no Express) - fetch each raw
+  // Solomon file directly and parse it client-side via parseSolomon.ts.
+  // Paths are relative (not "/data/...") so they resolve correctly whether
+  // the app is served from the domain root or a GitHub Pages subpath.
   const fetchInstances = async () => {
     try {
-      const res = await fetch('/api/instances');
-      if (!res.ok) {
-        console.error('Failed to load instances: HTTP status', res.status);
-        return;
-      }
-      const contentType = res.headers.get('content-type');
-      if (contentType && contentType.includes('application/json')) {
-        const data = await res.json();
-        if (Array.isArray(data)) {
-          setInstances(data);
-          if (data.length > 0 && !selectedInstanceId) {
-            setSelectedInstanceId(data[0].id);
-          }
+      const ids = Object.keys(BEST_KNOWN_SOLUTIONS);
+      const results = await Promise.all(ids.map(async (id) => {
+        try {
+          const res = await fetch(`data/${id}.txt`);
+          if (!res.ok) return null;
+          const parsed = parseSolomonText(await res.text());
+          return {
+            id,
+            name: parsed.name || id.toUpperCase(),
+            customersCount: parsed.customers.length,
+            capacity: parsed.capacity,
+            vehicles: parsed.vehicleNumber
+          };
+        } catch {
+          return null;
         }
-      } else {
-        console.error('Failed to load instances: Non-JSON response');
+      }));
+      const data = results.filter((r): r is NonNullable<typeof r> => r !== null);
+      setInstances(data);
+      if (data.length > 0 && !selectedInstanceId) {
+        setSelectedInstanceId(data[0].id);
       }
     } catch (e) {
       console.error('Failed to load instances', e);
@@ -229,41 +244,43 @@ export default function App() {
 
   const fetchInstanceData = async (id: string) => {
     try {
-      const res = await fetch(`/api/instances/${id}`);
-      if (res.ok) {
-        const data = await res.json();
-        setInstanceData(data);
-      }
+      const uploadedText = uploadedInstanceText[id];
+      const text = uploadedText !== undefined ? uploadedText : await (await fetch(`data/${id}.txt`)).text();
+      setInstanceData(parseSolomonText(text));
     } catch (e) {
       console.error('Failed to load instance data', e);
     }
   };
 
-  const handleUpload = async () => {
+  const handleUpload = () => {
     if (!uploadName || !uploadContent) {
       setUploadError('Please provide both a name and file contents.');
       return;
     }
     try {
-      const res = await fetch('/api/upload', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ name: uploadName, content: uploadContent })
-      });
-      const data = await res.json();
-      if (res.ok) {
-        setShowUploadModal(false);
-        setUploadName('');
-        setUploadContent('');
-        setUploadError('');
-        // Refresh and select new
-        await fetchInstances();
-        setSelectedInstanceId(data.id);
-      } else {
-        setUploadError(data.error || 'Upload failed.');
-      }
+      const safeName = uploadName.replace(/[^a-zA-Z0-9_-]/g, '').toLowerCase();
+      const parsed = parseSolomonText(uploadContent);
+      // Held in memory only - a static deploy has nowhere to persist a
+      // file, so this (like everything else here) has to work without a
+      // backend; it's gone on refresh.
+      setUploadedInstanceText(prev => ({ ...prev, [safeName]: uploadContent }));
+      setInstances(prev => [
+        ...prev.filter(i => i.id !== safeName),
+        {
+          id: safeName,
+          name: parsed.name || safeName.toUpperCase(),
+          customersCount: parsed.customers.length,
+          capacity: parsed.capacity,
+          vehicles: parsed.vehicleNumber
+        }
+      ]);
+      setShowUploadModal(false);
+      setUploadName('');
+      setUploadContent('');
+      setUploadError('');
+      setSelectedInstanceId(safeName);
     } catch (e) {
-      setUploadError('Failed to communicate with the server.');
+      setUploadError('Failed to process the uploaded content.');
     }
   };
 
@@ -282,9 +299,14 @@ export default function App() {
 
     let instanceText: string;
     try {
-      const res = await fetch(`/data/${selectedInstanceId}.txt`);
-      if (!res.ok) throw new Error(`HTTP ${res.status}`);
-      instanceText = await res.text();
+      const uploadedText = uploadedInstanceText[selectedInstanceId];
+      if (uploadedText !== undefined) {
+        instanceText = uploadedText;
+      } else {
+        const res = await fetch(`data/${selectedInstanceId}.txt`);
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        instanceText = await res.text();
+      }
     } catch (e) {
       setActiveMessage(`Error: failed to load instance file (${e instanceof Error ? e.message : e})`);
       setIsSolving(false);
@@ -295,7 +317,9 @@ export default function App() {
 
     const optimalObj = BEST_KNOWN_SOLUTIONS[selectedInstanceId];
 
-    const worker = new Worker('/solverWorker.js');
+    // Relative path - resolves correctly whether served from the domain
+    // root or a GitHub Pages project subpath.
+    const worker = new Worker('solverWorker.js');
     workerRef.current = worker;
 
     worker.onmessage = (event) => {

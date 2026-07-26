@@ -8,13 +8,12 @@ const PORT = 3000;
 
 app.use(express.json({ limit: '10mb' }));
 
-// Raw Solomon-format instance text, served statically so the in-browser
-// solver (public/solverWorker.js, running the Go solver compiled to wasm)
-// can fetch it directly - the wasm build has no filesystem of its own and
-// Go's os.ReadFile there is satisfied by a virtual file the worker
-// populates from this response body. /api/instances/:id below still exists
-// separately for the pre-parsed JSON the React UI itself renders.
-app.use('/data', express.static(path.join(process.cwd(), 'data')));
+// Raw Solomon-format instance text lives in public/data/*.txt (moved there,
+// from a former top-level data/, so a plain `vite build` copies it into
+// dist/data/*.txt for static hosting - see src/parseSolomon.ts). No explicit
+// static route needed for it here: Vite's own dev middleware (mounted below)
+// already serves publicDir contents, and the production branch's
+// `express.static(distPath)` covers the built copy the same way.
 
 // 1. Helper: Parse Solomon benchmark text format
 interface Customer {
@@ -98,9 +97,11 @@ function parseSolomonText(content: string) {
   };
 }
 
-// 2. API: Get list of instances
+// 2. API: Get list of instances (unused by the frontend now - see
+// src/App.tsx, which parses public/data/*.txt client-side instead - kept
+// working here for anyone hitting it directly)
 app.get('/api/instances', (req, res) => {
-  const dirPath = path.join(process.cwd(), 'data');
+  const dirPath = path.join(process.cwd(), 'public', 'data');
   if (!fs.existsSync(dirPath)) {
     return res.json([]);
   }
@@ -122,10 +123,11 @@ app.get('/api/instances', (req, res) => {
   res.json(instances);
 });
 
-// 3. API: Get details of a specific instance
+// 3. API: Get details of a specific instance (unused by the frontend now,
+// same as above)
 app.get('/api/instances/:id', (req, res) => {
   const instanceId = req.params.id;
-  const filePath = path.join(process.cwd(), 'data', `${instanceId}.txt`);
+  const filePath = path.join(process.cwd(), 'public', 'data', `${instanceId}.txt`);
 
   if (!fs.existsSync(filePath)) {
     return res.status(404).json({ error: 'Instance not found' });
@@ -140,7 +142,10 @@ app.get('/api/instances/:id', (req, res) => {
   }
 });
 
-// 4. API: Upload raw custom Solomon text content
+// 4. API: Upload raw custom Solomon text content (unused by the frontend
+// now - src/App.tsx's handleUpload parses+holds uploads client-side/in-memory
+// instead, since a static deploy has nowhere to persist a file to; kept
+// working here for anyone hitting it directly against a running dev server)
 app.post('/api/upload', (req, res) => {
   const { name, content } = req.body;
   if (!name || !content) {
@@ -149,8 +154,8 @@ app.post('/api/upload', (req, res) => {
 
   try {
     const safeName = name.replace(/[^a-zA-Z0-9_\-]/g, '').toLowerCase();
-    const filePath = path.join(process.cwd(), 'data', `${safeName}.txt`);
-    fs.mkdirSync(path.join(process.cwd(), 'data'), { recursive: true });
+    const filePath = path.join(process.cwd(), 'public', 'data', `${safeName}.txt`);
+    fs.mkdirSync(path.join(process.cwd(), 'public', 'data'), { recursive: true });
     fs.writeFileSync(filePath, content, 'utf8');
 
     // Test parse

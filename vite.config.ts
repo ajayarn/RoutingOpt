@@ -5,6 +5,11 @@ import {defineConfig} from 'vite';
 
 export default defineConfig(() => {
   return {
+    // Relative, not an absolute "/" or a hardcoded "/RoutingOpt/" - works
+    // whether the built output ends up served from the domain root or a
+    // GitHub Pages project subpath (https://<user>.github.io/<repo>/),
+    // without needing to know which in advance.
+    base: './',
     plugins: [react(), tailwindcss()],
     resolve: {
       alias: {

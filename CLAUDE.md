@@ -9,8 +9,13 @@ dashboard that runs a Large Neighborhood Search (LNS) / Simulated Annealing (SA)
 (written in Go, compiled to WebAssembly) **entirely client-side**, in a Web Worker, streaming live
 optimization progress (routes, distance, vehicle count, solver log) to the UI via `postMessage`.
 LKH3 (a C TSP/VRP solver) is available as an optional stagnation sub-solver, also compiled to
-WASM. The Express backend that remains only serves instance data (parsed JSON + raw Solomon text)
-and static assets — it does not run or proxy any part of the solve itself.
+WASM.
+
+**The app is fully static now — no backend required at all, not even for instance data.** It's
+deployed to GitHub Pages at https://ajayarn.github.io/RoutingOpt/ (see "Deployment: GitHub Pages"
+below). `server.ts`/Express still exists and still runs for local dev (`npm run dev`), but purely
+as a dev-convenience wrapper around Vite - the frontend no longer calls any of its API routes for
+anything on the critical path (see "API surface").
 
 It was originally scaffolded by Google AI Studio (`metadata.json`, `majorCapabilities:
 MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API`) and used Gemini, then local Ollama, as an LLM-guided
@@ -133,7 +138,7 @@ npm run lint      # tsc --noEmit
 npm run clean     # rm -rf dist server.js solver_bin
 
 ./build_solver.sh          # compiles solver/main.go + solver/lkh_native.go -> solver_bin (native CLI, standalone use only)
-./solver_bin -file data/c101.txt -iterations 1000 -algorithm lns   # standalone Go solver
+./solver_bin -file public/data/c101.txt -iterations 1000 -algorithm lns   # standalone Go solver
 
 ./build_lkh.sh              # compiles lkh3src/ -> lkh_bin (native, used by solver_bin's LKH path)
 ./build_lkh_wasm.sh         # compiles lkh3src/ -> lkh_wasm.cjs/lkh_wasm.wasm via Emscripten (needs tools/emsdk/, gitignored - see script for setup)
@@ -150,17 +155,25 @@ frontend fetches `/wasm/solver.wasm` directly), so stale or missing files there 
 
 ## Problem data
 
-`data/*.txt` holds all 56 Solomon 100-customer VRPTW benchmark instances (c1/c2/r1/r2/rc1/rc2
+`public/data/*.txt` holds all 56 Solomon 100-customer VRPTW benchmark instances (c1/c2/r1/r2/rc1/rc2
 series - originally sourced from `problems_100_customers/`, untracked, kept as the raw reference
 copy), in the standard Solomon text format (name / VEHICLE NUMBER+CAPACITY / CUSTOMER table with
-`readyTime`/`dueDate`/`serviceTime` columns). There are **two separate parsers** for this same
-format — `parseSolomonText` in `server.ts` and `parseSolomonFile` in `solver/main.go` — kept in
-sync by hand. If you change the parsing logic or the data format, update both.
+`readyTime`/`dueDate`/`serviceTime` columns). Living under `public/` means a plain `vite build`
+copies it into `dist/data/*.txt` automatically - required for the static GitHub Pages deploy,
+where there's no server to ask for a file listing or a parsed instance.
 
-Users can also upload custom instances via `POST /api/upload` (written to `data/<name>.txt`).
-`data/` is also served statically at `/data/*` (`express.static`) so the browser can fetch the raw
-Solomon text directly — the wasm solver has no filesystem of its own; the worker fetches this raw
-text and hands it to Go's `os.ReadFile` via the virtual fs shim described above.
+There are **two parsers** for this format now, not three - `src/parseSolomon.ts` (used by the
+frontend: instance listing, instance detail, upload) and `parseSolomonFile` in `solver/main.go`
+(Go, used by the actual solve). `server.ts` still has its own near-identical copy of the same
+logic backing its now-frontend-unused `/api/instances*` routes (see "API surface") - if you
+change the parsing logic or the Solomon format assumptions, update all three, though only
+`src/parseSolomon.ts` and `solver/main.go`'s are actually load-bearing for the running app.
+
+Users can upload custom instances via the UI's upload modal - handled entirely client-side now
+(`handleUpload` in `src/App.tsx` parses the pasted text with `parseSolomon.ts` and holds it in an
+in-memory `uploadedInstanceText` map), since a static deploy has nowhere to persist an uploaded
+file to. Uploads are session-only - gone on refresh - and behave identically whether running via
+`npm run dev` or the deployed static site (no dev/prod divergence).
 
 Best-known solution distances used for early-stop are in `src/App.tsx`'s `BEST_KNOWN_SOLUTIONS`
 (client-side only — `server.ts` has no copy), scraped from
@@ -196,16 +209,49 @@ this file's history were wrong (rc201's was actually rc103's value).
 - Also contains a since-removed-from-the-app LLM destroy call (`ollamaGenerateJSON` inline in
   `runSolverStream`) — vestigial, since nothing invokes this file at all.
 
-## API surface (`server.ts`)
+## API surface (`server.ts`) — none of this is used by the running app anymore
 
-- `GET /api/instances` — list available Solomon instances from `data/`
+`src/App.tsx` no longer calls any of these; they're left working for local `npm run dev` use
+(e.g. hitting them directly with curl) but are not load-bearing:
+
+- `GET /api/instances` — list available Solomon instances from `public/data/` (reads
+  `path.join(process.cwd(), 'public', 'data')` - update this path too if `public/data/` ever
+  moves again)
 - `GET /api/instances/:id` — parsed instance detail (JSON)
-- `GET /data/<id>.txt` — raw Solomon-format text (`express.static`), for the wasm solver's virtual
-  filesystem to fetch directly
-- `POST /api/upload` — save + parse a custom Solomon-format instance
+- `POST /api/upload` — parse + write a custom Solomon-format instance to `public/data/<name>.txt`
+  (only persists for the current dev server process - does nothing useful against the deployed
+  static site, which is why the frontend doesn't use this anymore either)
 
-That's it — no solve or LLM endpoints anymore. The actual solve runs entirely in the browser (see
-"Client-side execution").
+There's no `/data/*` static route anymore - it was redundant once `data/` moved under `public/`:
+Vite's own dev middleware and the production `express.static(distPath)` branch both already serve
+`public/`'s contents automatically.
+
+The actual solve runs entirely in the browser (see "Client-side execution") and instance
+data/listing/upload are all client-side now too (see "Problem data") - `server.ts` has no
+routes on the critical path at all.
+
+## Deployment: GitHub Pages
+
+The app is deployed as a fully static site at **https://ajayarn.github.io/RoutingOpt/** via
+`.github/workflows/deploy-pages.yml`, which on every push to `main` (or manual
+`workflow_dispatch`) runs `npm run build:pages` (`vite build` only - skips the `esbuild
+server.ts ...` step in the regular `build` script, which isn't needed for a static deploy) and
+publishes `dist/` via `actions/upload-pages-artifact` + `actions/deploy-pages`. The repo's Pages
+source is set to `build_type: workflow` (done once via `gh api --method POST
+repos/ajayarn/RoutingOpt/pages -f build_type=workflow`) so Actions is what serves it, not a
+`gh-pages` branch.
+
+Two things make a plain `vite build` output actually work when served from a subpath
+(`/RoutingOpt/`, not the domain root) instead of needing a hardcoded path:
+- `vite.config.ts` sets `base: './'` (relative, not absolute) so every Vite-bundled asset
+  reference resolves correctly regardless of subpath depth.
+- Every hand-written root-absolute path elsewhere (`new Worker('/solverWorker.js')`,
+  `fetch('/data/...')`, and inside `public/solverWorker.js` its `importScripts(...)` and the
+  `solver.wasm` fetch) was changed to a **relative** path - Vite doesn't rewrite plain runtime
+  string literals like these, only its own bundled `import`/asset references, so these needed
+  fixing by hand. If you add a new absolute `/xxx` path reference anywhere in the frontend or
+  worker, it will 404 on Pages even though it works fine locally at the domain root - use a
+  relative path instead.
 
 ## Feasibility
 

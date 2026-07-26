@@ -157,7 +157,10 @@ self.fs = {
   utimes(path, atime, mtime, callback) { callback(null); },
 };
 
-importScripts("/wasm/wasm_exec.js", "/wasm/lkh_wasm.js");
+// Relative (not "/wasm/...") - resolves against this worker script's own
+// URL regardless of whether the site is served from the domain root or a
+// GitHub Pages project subpath.
+importScripts("wasm/wasm_exec.js", "wasm/lkh_wasm.js");
 
 // js.Value.Invoke() on the Go side (solver/lkh_wasm.go) blocks synchronously
 // until this JS function returns, so it must be synchronous - but
@@ -174,7 +177,17 @@ let lkhPoolPrimed = false;
 
 async function refillLkhPool() {
   while (lkhPool.length < LKH_POOL_SIZE) {
-    lkhPool.push(await LKHModule({ print: () => {}, printErr: (t) => console.error("[lkh-wasm]", t) }));
+    lkhPool.push(await LKHModule({
+      print: () => {},
+      printErr: (t) => console.error("[lkh-wasm]", t),
+      // Emscripten's own scriptDirectory detection resolves against this
+      // worker's own URL (self.location - importScripts doesn't change it),
+      // not wasm/lkh_wasm.js's URL, so left to its own devices it looks for
+      // lkh_wasm.wasm next to solverWorker.js instead of under wasm/ -
+      // works by coincidence when everything's at the domain root, breaks
+      // under any subpath (e.g. GitHub Pages). locateFile overrides that.
+      locateFile: (path) => "wasm/" + path,
+    }));
   }
 }
 
@@ -223,7 +236,7 @@ self.onmessage = async (event) => {
     }
     go.argv = argv;
 
-    const resp = await fetch("/wasm/solver.wasm");
+    const resp = await fetch("wasm/solver.wasm");
     if (!resp.ok) {
       throw new Error(`Failed to fetch solver.wasm: HTTP ${resp.status}`);
     }
