@@ -1,7 +1,7 @@
 #!/bin/bash
 echo "==> Building Go VRPTW Solver..."
 if command -v go &> /dev/null; then
-  go build -ldflags="-s -w" -o solver_bin solver/main.go
+  go build -ldflags="-s -w" -o solver_bin solver/main.go solver/lkh_native.go
   if [ $? -eq 0 ]; then
     echo "==> Compilation successful. Generated solver_bin."
     chmod +x solver_bin

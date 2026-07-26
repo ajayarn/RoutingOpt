@@ -10,8 +10,6 @@ import (
 	"math/rand"
 	"net/http"
 	"os"
-	"os/exec"
-	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
@@ -1350,84 +1348,14 @@ func invokeLKHSubSolver(destroyedCustomers []Customer, depot Customer, capacity 
 		vehicles = n
 	}
 
-	tmpDir, err := os.MkdirTemp("", "lkh_sub_*")
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "LKH: failed to create temp dir: %v\n", err)
-		return nil
-	}
-	defer os.RemoveAll(tmpDir)
+	instanceText := buildLKHInstanceText(destroyedCustomers, depot, capacity, n, vehicles)
 
-	instancePath := filepath.Join(tmpDir, "sub.vrptw")
-	parPath := filepath.Join(tmpDir, "sub.par")
-	solPath := filepath.Join(tmpDir, "sub.sol")
-
-	var instance strings.Builder
-	fmt.Fprintf(&instance, "NAME : sub\n")
-	fmt.Fprintf(&instance, "TYPE : CVRPTW\n")
-	fmt.Fprintf(&instance, "DIMENSION : %d\n", n+1)
-	fmt.Fprintf(&instance, "VEHICLES : %d\n", vehicles)
-	fmt.Fprintf(&instance, "CAPACITY : %d\n", int(math.Round(capacity)))
-	fmt.Fprintf(&instance, "EDGE_WEIGHT_TYPE : EXACT_2D\n")
-
-	fmt.Fprintf(&instance, "NODE_COORD_SECTION\n")
-	fmt.Fprintf(&instance, "1 %.6f %.6f\n", depot.X, depot.Y)
-	for i, c := range destroyedCustomers {
-		fmt.Fprintf(&instance, "%d %.6f %.6f\n", i+2, c.X, c.Y)
-	}
-
-	fmt.Fprintf(&instance, "DEMAND_SECTION\n")
-	fmt.Fprintf(&instance, "1 0\n")
-	for i, c := range destroyedCustomers {
-		fmt.Fprintf(&instance, "%d %d\n", i+2, int(math.Round(c.Demand)))
-	}
-
-	// This LKH3 build only recognizes a single scalar SERVICE_TIME for the whole
-	// instance (SERVICE_TIME_SECTION is not registered as a top-level keyword in
-	// ReadProblem here) - safe because Solomon/Homberger instances use a uniform
-	// per-customer service time (verified against data/rc201.txt: only 0/depot
-	// and one shared nonzero value occur).
-	fmt.Fprintf(&instance, "SERVICE_TIME : %.6f\n", destroyedCustomers[0].ServiceTime)
-
-	// 6 fields per row: id, earliest, latest, then 3 pickup-delivery fields this
-	// parser always consumes regardless of problem type (unused here, hence 0 0 0).
-	fmt.Fprintf(&instance, "TIME_WINDOW_SECTION\n")
-	fmt.Fprintf(&instance, "1 %.6f %.6f 0 0 0\n", depot.ReadyTime, depot.DueDate)
-	for i, c := range destroyedCustomers {
-		fmt.Fprintf(&instance, "%d %.6f %.6f 0 0 0\n", i+2, c.ReadyTime, c.DueDate)
-	}
-
-	fmt.Fprintf(&instance, "DEPOT_SECTION\n1\n-1\nEOF\n")
-
-	if err := os.WriteFile(instancePath, []byte(instance.String()), 0644); err != nil {
-		fmt.Fprintf(os.Stderr, "LKH: failed to write instance file: %v\n", err)
+	solText, ok := runLKHSolver(instanceText, rand.Int63n(1<<31))
+	if !ok {
 		return nil
 	}
 
-	par := fmt.Sprintf(
-		"PROBLEM_FILE = %s\nMTSP_SOLUTION_FILE = %s\nMAX_TRIALS = 200\nRUNS = 1\nTRACE_LEVEL = 0\nSEED = %d\n",
-		instancePath, solPath, rand.Int63n(1<<31),
-	)
-	if err := os.WriteFile(parPath, []byte(par), 0644); err != nil {
-		fmt.Fprintf(os.Stderr, "LKH: failed to write parameter file: %v\n", err)
-		return nil
-	}
-
-	// No timeout: LKH's value is expected to matter most on the larger
-	// subproblems, which need more search time - let it run to completion
-	// (MAX_TRIALS/RUNS below still bound the search itself).
-	cmd := exec.Command("./lkh_bin", parPath)
-	if err := cmd.Run(); err != nil {
-		fmt.Fprintf(os.Stderr, "LKH: invocation failed (n=%d, vehicles=%d): %v\n", n, vehicles, err)
-		return nil
-	}
-
-	solData, err := os.ReadFile(solPath)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "LKH: failed to read solution file (n=%d, vehicles=%d): %v\n", n, vehicles, err)
-		return nil
-	}
-
-	lines := strings.Split(strings.TrimSpace(string(solData)), "\n")
+	lines := strings.Split(strings.TrimSpace(solText), "\n")
 	if len(lines) < 2 {
 		return nil
 	}
@@ -1491,6 +1419,51 @@ func invokeLKHSubSolver(destroyedCustomers []Customer, depot Customer, capacity 
 	subSol := Solution{Routes: routes}
 	recalculateSolutionMetrics(&subSol)
 	return &subSol
+}
+
+// buildLKHInstanceText renders the CVRPTW subproblem (destroyedCustomers) into
+// LKH3's instance-file text format. Platform-independent - both the native
+// (exec.Command) and wasm (JS-bridged) runLKHSolver implementations call this
+// for identical instance content.
+func buildLKHInstanceText(destroyedCustomers []Customer, depot Customer, capacity float64, n, vehicles int) string {
+	var instance strings.Builder
+	fmt.Fprintf(&instance, "NAME : sub\n")
+	fmt.Fprintf(&instance, "TYPE : CVRPTW\n")
+	fmt.Fprintf(&instance, "DIMENSION : %d\n", n+1)
+	fmt.Fprintf(&instance, "VEHICLES : %d\n", vehicles)
+	fmt.Fprintf(&instance, "CAPACITY : %d\n", int(math.Round(capacity)))
+	fmt.Fprintf(&instance, "EDGE_WEIGHT_TYPE : EXACT_2D\n")
+
+	fmt.Fprintf(&instance, "NODE_COORD_SECTION\n")
+	fmt.Fprintf(&instance, "1 %.6f %.6f\n", depot.X, depot.Y)
+	for i, c := range destroyedCustomers {
+		fmt.Fprintf(&instance, "%d %.6f %.6f\n", i+2, c.X, c.Y)
+	}
+
+	fmt.Fprintf(&instance, "DEMAND_SECTION\n")
+	fmt.Fprintf(&instance, "1 0\n")
+	for i, c := range destroyedCustomers {
+		fmt.Fprintf(&instance, "%d %d\n", i+2, int(math.Round(c.Demand)))
+	}
+
+	// This LKH3 build only recognizes a single scalar SERVICE_TIME for the whole
+	// instance (SERVICE_TIME_SECTION is not registered as a top-level keyword in
+	// ReadProblem here) - safe because Solomon/Homberger instances use a uniform
+	// per-customer service time (verified against data/rc201.txt: only 0/depot
+	// and one shared nonzero value occur).
+	fmt.Fprintf(&instance, "SERVICE_TIME : %.6f\n", destroyedCustomers[0].ServiceTime)
+
+	// 6 fields per row: id, earliest, latest, then 3 pickup-delivery fields this
+	// parser always consumes regardless of problem type (unused here, hence 0 0 0).
+	fmt.Fprintf(&instance, "TIME_WINDOW_SECTION\n")
+	fmt.Fprintf(&instance, "1 %.6f %.6f 0 0 0\n", depot.ReadyTime, depot.DueDate)
+	for i, c := range destroyedCustomers {
+		fmt.Fprintf(&instance, "%d %.6f %.6f 0 0 0\n", i+2, c.ReadyTime, c.DueDate)
+	}
+
+	fmt.Fprintf(&instance, "DEPOT_SECTION\n1\n-1\nEOF\n")
+
+	return instance.String()
 }
 
 func invokeLLMToSelectTrucks(bestSol Solution, instanceName string, history []DestructionAttempt, minDestroy, maxDestroy int) []int {

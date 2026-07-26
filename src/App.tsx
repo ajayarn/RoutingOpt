@@ -17,6 +17,7 @@ import {
   FileText
 } from 'lucide-react';
 import { Customer, VRPTWInstance, Route, SolverSolution, SolverParams, SolverProgressMessage } from './types';
+import InstanceCombobox from './InstanceCombobox';
 
 // Standard 6 distinct high-contrast colors for routes
 const ROUTE_COLORS = [
@@ -34,13 +35,73 @@ const ROUTE_COLORS = [
   '#b45309'  // brown
 ];
 
+// Source: https://www.sintef.no/projectweb/top/vrptw/100-customers/ (all 56 Solomon
+// 100-customer instances). Note this replaced a handful of previously-hardcoded values
+// that turned out to be wrong (r101 was 1645.79, rc201 was 1261.67 - the latter was
+// actually rc103's value) - trust this table over old numbers seen elsewhere.
 export const BEST_KNOWN_SOLUTIONS: Record<string, { distance: number; vehicles: number }> = {
+  // C1 series
   c101: { distance: 828.94, vehicles: 10 },
+  c102: { distance: 828.94, vehicles: 10 },
+  c103: { distance: 828.06, vehicles: 10 },
+  c104: { distance: 824.78, vehicles: 10 },
+  c105: { distance: 828.94, vehicles: 10 },
+  c106: { distance: 828.94, vehicles: 10 },
+  c107: { distance: 828.94, vehicles: 10 },
+  c108: { distance: 828.94, vehicles: 10 },
+  c109: { distance: 828.94, vehicles: 10 },
+  // C2 series
   c201: { distance: 591.56, vehicles: 3 },
-  r101: { distance: 1645.79, vehicles: 19 },
+  c202: { distance: 591.56, vehicles: 3 },
+  c203: { distance: 591.17, vehicles: 3 },
+  c204: { distance: 590.6, vehicles: 3 },
+  c205: { distance: 588.88, vehicles: 3 },
+  c206: { distance: 588.49, vehicles: 3 },
+  c207: { distance: 588.29, vehicles: 3 },
+  c208: { distance: 588.32, vehicles: 3 },
+  // R1 series
+  r101: { distance: 1650.8, vehicles: 19 },
+  r102: { distance: 1486.12, vehicles: 17 },
+  r103: { distance: 1292.68, vehicles: 13 },
+  r104: { distance: 1007.31, vehicles: 9 },
+  r105: { distance: 1377.11, vehicles: 14 },
+  r106: { distance: 1252.03, vehicles: 12 },
+  r107: { distance: 1104.66, vehicles: 10 },
+  r108: { distance: 960.88, vehicles: 9 },
+  r109: { distance: 1194.73, vehicles: 11 },
+  r110: { distance: 1118.84, vehicles: 10 },
+  r111: { distance: 1096.73, vehicles: 10 },
+  r112: { distance: 982.14, vehicles: 9 },
+  // R2 series
   r201: { distance: 1252.37, vehicles: 4 },
-  rc101: { distance: 1696.94, vehicles: 14 },
-  rc201: { distance: 1261.67, vehicles: 4 }
+  r202: { distance: 1191.7, vehicles: 3 },
+  r203: { distance: 939.5, vehicles: 3 },
+  r204: { distance: 825.52, vehicles: 2 },
+  r205: { distance: 994.43, vehicles: 3 },
+  r206: { distance: 906.14, vehicles: 3 },
+  r207: { distance: 890.61, vehicles: 2 },
+  r208: { distance: 726.82, vehicles: 2 },
+  r209: { distance: 909.16, vehicles: 3 },
+  r210: { distance: 939.37, vehicles: 3 },
+  r211: { distance: 885.71, vehicles: 2 },
+  // RC1 series
+  rc101: { distance: 1696.95, vehicles: 14 },
+  rc102: { distance: 1554.75, vehicles: 12 },
+  rc103: { distance: 1261.67, vehicles: 11 },
+  rc104: { distance: 1135.48, vehicles: 10 },
+  rc105: { distance: 1629.44, vehicles: 13 },
+  rc106: { distance: 1424.73, vehicles: 11 },
+  rc107: { distance: 1230.48, vehicles: 11 },
+  rc108: { distance: 1139.82, vehicles: 10 },
+  // RC2 series
+  rc201: { distance: 1406.94, vehicles: 4 },
+  rc202: { distance: 1365.65, vehicles: 3 },
+  rc203: { distance: 1049.62, vehicles: 3 },
+  rc204: { distance: 798.46, vehicles: 3 },
+  rc205: { distance: 1297.65, vehicles: 4 },
+  rc206: { distance: 1146.32, vehicles: 3 },
+  rc207: { distance: 1061.14, vehicles: 3 },
+  rc208: { distance: 828.14, vehicles: 3 },
 };
 
 export const OPTIMAL_SOLUTIONS: Record<string, { distance: number; vehicles: number; routes: number[][] }> = {
@@ -68,7 +129,6 @@ export default function App() {
     algorithm: 'lns',
     maxIterations: 1000,
     llmThreshold: 20,
-    useLlm: false,
     useLkh: false
   });
 
@@ -96,7 +156,7 @@ export default function App() {
   const [uploadError, setUploadError] = useState('');
   const [isViewingOptimal, setIsViewingOptimal] = useState(false);
 
-  const eventSourceRef = useRef<EventSource | null>(null);
+  const workerRef = useRef<Worker | null>(null);
   const timerRef = useRef<NodeJS.Timeout | null>(null);
   const logScrollRef = useRef<HTMLDivElement | null>(null);
 
@@ -207,7 +267,7 @@ export default function App() {
     }
   };
 
-  const startSolver = () => {
+  const startSolver = async () => {
     if (isSolving) return;
 
     setIsSolving(true);
@@ -218,91 +278,117 @@ export default function App() {
     setHoveredRoute(null);
     setElapsedTime(0);
     setIsViewingOptimal(false);
-    setActiveMessage('Initializing Go VRPTW Solver...');
+    setActiveMessage('Loading instance data...');
+
+    let instanceText: string;
+    try {
+      const res = await fetch(`/data/${selectedInstanceId}.txt`);
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      instanceText = await res.text();
+    } catch (e) {
+      setActiveMessage(`Error: failed to load instance file (${e instanceof Error ? e.message : e})`);
+      setIsSolving(false);
+      return;
+    }
+
+    setActiveMessage('Initializing Go VRPTW Solver (WASM)...');
 
     const optimalObj = BEST_KNOWN_SOLUTIONS[selectedInstanceId];
-    const optimalParam = optimalObj ? `&optimal=${optimalObj.distance}` : '';
-    const llmParam = params.llmThreshold ? `&llmThreshold=${params.llmThreshold}` : '';
-    const useLlmParam = `&useLlm=${params.useLlm ? 'true' : 'false'}`;
-    const useLkhParam = `&useLkh=${params.useLkh ? 'true' : 'false'}`;
-    const url = `/api/solve-stream?instance=${selectedInstanceId}&iterations=${params.maxIterations}&algorithm=${params.algorithm}${optimalParam}${llmParam}${useLlmParam}${useLkhParam}`;
-    const es = new EventSource(url);
-    eventSourceRef.current = es;
 
-    es.onmessage = (event) => {
-      try {
-        const msg: SolverProgressMessage = JSON.parse(event.data);
-        if (msg.type === 'start') {
-          const startMsg = msg.message || 'Solver started...';
-          setActiveMessage(startMsg);
-          setSolverLogs([startMsg]);
-        } else if (msg.type === 'progress') {
-          if (msg.routes && msg.bestDistance !== undefined && msg.bestVehicles !== undefined) {
-            const currentSol: SolverSolution = {
-              routes: msg.routes,
-              totalDistance: msg.bestDistance,
-              totalVehicles: msg.bestVehicles,
-              isFeasible: true,
-              computationTimeMs: msg.computationTimeMs || 0,
-              iteration: msg.iteration
-            };
-            setSolution(currentSol);
-            setProgressHistory(prev => [
-              ...prev,
-              {
-                iteration: msg.iteration || 0,
-                distance: msg.bestDistance || 0,
-                vehicles: msg.bestVehicles || 0
-              }
-            ]);
-            
-            if (msg.message) {
-              setActiveMessage(msg.message);
-              setSolverLogs(prev => [...prev, msg.message]);
-            } else {
-              setActiveMessage(`Optimizing... Iteration ${msg.iteration}/${params.maxIterations}`);
+    const worker = new Worker('/solverWorker.js');
+    workerRef.current = worker;
+
+    worker.onmessage = (event) => {
+      const msg: SolverProgressMessage = event.data;
+      if (msg.type === 'start') {
+        const startMsg = msg.message || 'Solver started...';
+        setActiveMessage(startMsg);
+        setSolverLogs([startMsg]);
+      } else if (msg.type === 'progress') {
+        if (msg.routes && msg.bestDistance !== undefined && msg.bestVehicles !== undefined) {
+          const currentSol: SolverSolution = {
+            routes: msg.routes,
+            totalDistance: msg.bestDistance,
+            totalVehicles: msg.bestVehicles,
+            isFeasible: true,
+            computationTimeMs: msg.computationTimeMs || 0,
+            iteration: msg.iteration
+          };
+          setSolution(currentSol);
+          setProgressHistory(prev => [
+            ...prev,
+            {
+              iteration: msg.iteration || 0,
+              distance: msg.bestDistance || 0,
+              vehicles: msg.bestVehicles || 0
             }
+          ]);
+
+          if (msg.message) {
+            setActiveMessage(msg.message);
+            setSolverLogs(prev => [...prev, msg.message]);
+          } else {
+            setActiveMessage(`Optimizing... Iteration ${msg.iteration}/${params.maxIterations}`);
           }
-        } else if (msg.type === 'result') {
-          if (msg.routes && msg.bestDistance !== undefined && msg.bestVehicles !== undefined) {
-            const finalSol: SolverSolution = {
-              routes: msg.routes,
-              totalDistance: msg.bestDistance,
-              totalVehicles: msg.bestVehicles,
-              isFeasible: true,
-              computationTimeMs: msg.computationTimeMs || 0,
-              iteration: params.maxIterations
-            };
-            setSolution(finalSol);
-            const resultMsg = msg.message || 'Optimization completed successfully.';
-            setActiveMessage(resultMsg);
-            setSolverLogs(prev => [...prev, resultMsg]);
-          }
-          es.close();
-          setIsSolving(false);
-        } else if (msg.type === 'error') {
-          const errMsg = `Error: ${msg.message}`;
-          setActiveMessage(errMsg);
-          setSolverLogs(prev => [...prev, errMsg]);
-          es.close();
-          setIsSolving(false);
         }
-      } catch (e) {
-        console.error('Failed to parse progress update', e);
+      } else if (msg.type === 'result') {
+        if (msg.routes && msg.bestDistance !== undefined && msg.bestVehicles !== undefined) {
+          const finalSol: SolverSolution = {
+            routes: msg.routes,
+            totalDistance: msg.bestDistance,
+            totalVehicles: msg.bestVehicles,
+            isFeasible: true,
+            computationTimeMs: msg.computationTimeMs || 0,
+            iteration: params.maxIterations
+          };
+          setSolution(finalSol);
+          const resultMsg = msg.message || 'Optimization completed successfully.';
+          setActiveMessage(resultMsg);
+          setSolverLogs(prev => [...prev, resultMsg]);
+        }
+        worker.terminate();
+        workerRef.current = null;
+        setIsSolving(false);
+      } else if (msg.type === 'error') {
+        const errMsg = `Error: ${msg.message}`;
+        setActiveMessage(errMsg);
+        setSolverLogs(prev => [...prev, errMsg]);
+        worker.terminate();
+        workerRef.current = null;
+        setIsSolving(false);
       }
     };
 
-    es.onerror = (e) => {
-      console.error('SSE Error', e);
-      setActiveMessage('Solver connection closed.');
-      es.close();
+    worker.onerror = (e) => {
+      console.error('Worker error', e);
+      setActiveMessage(`Error: solver worker crashed (${e.message || 'unknown error'})`);
+      worker.terminate();
+      workerRef.current = null;
       setIsSolving(false);
     };
+
+    worker.postMessage({
+      type: 'solve',
+      instanceText,
+      args: {
+        iterations: params.maxIterations,
+        algorithm: params.algorithm,
+        llmThreshold: params.llmThreshold ?? 20,
+        optimal: optimalObj?.distance,
+        useLkh: !!params.useLkh,
+        seed: Date.now(),
+      }
+    });
   };
 
   const stopSolver = () => {
-    if (eventSourceRef.current) {
-      eventSourceRef.current.close();
+    // The wasm solve loop runs synchronously inside the worker's single JS
+    // thread once started - it can't poll for a "please stop" message
+    // mid-computation, so terminate() (matching the old child.kill() on the
+    // native subprocess) is the only way to interrupt it.
+    if (workerRef.current) {
+      workerRef.current.terminate();
+      workerRef.current = null;
     }
     setIsSolving(false);
     setActiveMessage('Solver interrupted by user.');
@@ -465,19 +551,12 @@ export default function App() {
             {/* Instance Selector */}
             <div className="mb-4">
               <label className="block text-xs font-semibold text-slate-600 mb-1.5" htmlFor="instance-select">Select Benchmark Instance</label>
-              <select
-                id="instance-select"
+              <InstanceCombobox
+                instances={instances}
                 value={selectedInstanceId}
                 disabled={isSolving}
-                onChange={(e) => setSelectedInstanceId(e.target.value)}
-                className="w-full text-sm border border-slate-300 rounded-lg p-2 bg-white focus:border-blue-500 focus:ring-1 focus:ring-blue-500 disabled:opacity-50"
-              >
-                {instances.map(inst => (
-                  <option key={inst.id} value={inst.id}>
-                    {inst.name} ({inst.customersCount} Customers)
-                  </option>
-                ))}
-              </select>
+                onChange={setSelectedInstanceId}
+              />
             </div>
 
             {/* Algorithm selector */}
@@ -531,28 +610,8 @@ export default function App() {
                 className="w-full text-sm border border-slate-300 rounded-lg p-2 bg-white focus:border-blue-500 focus:ring-1 focus:ring-blue-500 disabled:opacity-50"
               />
               <p className="text-[11px] text-slate-400 mt-1.5 leading-normal">
-                After this many stagnant iterations with no improvement, the solver destroys 2-5 routes and re-solves using its built-in heuristic (or the Ollama LLM, if enabled below). Set to 0 to bypass.
+                After this many stagnant iterations with no improvement, the solver destroys 2-5 routes and re-solves using its built-in heuristic. Set to 0 to bypass.
               </p>
-
-              {/* Ollama LLM destroy switch */}
-              <div className="flex items-center justify-between mt-4 pt-4 border-t border-slate-100">
-                <label className="text-xs font-semibold text-slate-600" htmlFor="use-llm-toggle">
-                  Use Ollama LLM for destroy selection
-                </label>
-                <button
-                  id="use-llm-toggle"
-                  type="button"
-                  role="switch"
-                  aria-checked={!!params.useLlm}
-                  disabled={isSolving}
-                  onClick={() => setParams(prev => ({ ...prev, useLlm: !prev.useLlm }))}
-                  className={`shrink-0 relative inline-flex h-5 w-9 items-center rounded-full transition-colors disabled:opacity-50 ${params.useLlm ? 'bg-blue-600' : 'bg-slate-300'}`}
-                >
-                  <span
-                    className={`inline-block h-3.5 w-3.5 transform rounded-full bg-white transition-transform ${params.useLlm ? 'translate-x-5' : 'translate-x-1'}`}
-                  />
-                </button>
-              </div>
 
               {/* LKH3 stagnation sub-solver switch */}
               <div className="flex items-center justify-between mt-3 pt-3 border-t border-slate-100">

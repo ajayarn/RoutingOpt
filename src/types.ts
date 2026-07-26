@@ -42,7 +42,6 @@ export interface SolverParams {
   mutationRate?: number;
   destroyRate?: number;
   llmThreshold?: number;
-  useLlm?: boolean;
   useLkh?: boolean;
 }
 
