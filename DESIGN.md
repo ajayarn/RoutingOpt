@@ -37,9 +37,9 @@ directly; see "History" below.
 
 ## Request lifecycle for a live solve
 
-1. Frontend calls `GET /api/solve-stream?instance=&iterations=&algorithm=&llmThreshold=&optimal=&useLlm=`.
+1. Frontend calls `GET /api/solve-stream?instance=&iterations=&llmThreshold=&optimal=&useLlm=`.
 2. `server.ts` validates the instance file exists, then `spawn()`s
-   `solver_bin` with matching CLI flags (`-file`, `-iterations`, `-algorithm`,
+   `solver_bin` with matching CLI flags (`-file`, `-iterations`,
    `-llm-threshold`, `-optimal`, `-use-llm=<bool>`, `-seed <Date.now()>`).
 3. `solver_bin` prints one JSON `ProgressMessage` object per line to stdout
    as it solves. `server.ts` reads these via `readline` and relays each line
@@ -59,8 +59,7 @@ directly; see "History" below.
 - **Initial solution**: K-means clustering + insertion (`buildInitialSolution`).
 - **Destroy operators**: worst-distance and random removal.
 - **Repair**: greedy insertion.
-- **Acceptance**: always-accept on improvement; SA-style probabilistic
-  acceptance in `-algorithm sa` mode; random destroys always accepted.
+- **Acceptance**: always-accept on improvement; random destroys always accepted.
 - **Stagnation intervention**: after `-llm-threshold` iterations with no
   improvement, destroys 2–5 routes and re-solves the freed customers via a
   K-means + LNS sub-solver, escalating destroy size across up to 3 attempts.
@@ -142,7 +141,7 @@ caller (Go's `invokeLLMToSelectTrucks`) falls back to its own heuristic.
 ## Frontend layout
 
 `src/App.tsx` renders a 12-column grid: a fixed-width left column (Solver
-Controls — including the algorithm/stagnation-threshold/Ollama-switch
+Controls — including the stagnation-threshold/Ollama-switch
 controls — and Instance Specification) and a wide right-hand stack (Routing
 Visualization → Route Explorer, with an inline per-vehicle timeline when a
 route is selected → Status & History: live console, best-solution metrics,

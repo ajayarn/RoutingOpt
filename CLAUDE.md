@@ -5,8 +5,8 @@ Guidance for Claude Code when working in this repository.
 ## What this is
 
 RoutingOpt is an interactive Vehicle Routing Problem with Time Windows (VRPTW) solver: a React
-dashboard that runs a Large Neighborhood Search (LNS) / Simulated Annealing (SA) metaheuristic
-(written in Go, compiled to WebAssembly) **entirely client-side**, in a Web Worker, streaming live
+dashboard that runs a Large Neighborhood Search (LNS) metaheuristic (written in Go, compiled to
+WebAssembly) **entirely client-side**, in a Web Worker, streaming live
 optimization progress (routes, distance, vehicle count, solver log) to the UI via `postMessage`.
 LKH3 (a C TSP/VRP solver) is available as an optional stagnation sub-solver, also compiled to
 WASM.
@@ -138,7 +138,7 @@ npm run lint      # tsc --noEmit
 npm run clean     # rm -rf dist server.js solver_bin
 
 ./build_solver.sh          # compiles solver/main.go + solver/lkh_native.go -> solver_bin (native CLI, standalone use only)
-./solver_bin -file public/data/c101.txt -iterations 1000 -algorithm lns   # standalone Go solver
+./solver_bin -file public/data/c101.txt -iterations 1000   # standalone Go solver
 
 ./build_lkh.sh              # compiles lkh3src/ -> lkh_bin (native, used by solver_bin's LKH path)
 ./build_lkh_wasm.sh         # compiles lkh3src/ -> lkh_wasm.cjs/lkh_wasm.wasm via Emscripten (needs tools/emsdk/, gitignored - see script for setup)
@@ -186,8 +186,8 @@ this file's history were wrong (rc201's was actually rc103's value).
 - **Initial solution**: K-means clustering + insertion (`buildInitialSolution`).
 - **Destroy operators**: worst-distance and random removal (`destroyWorst`/`destroyRandom`).
 - **Repair**: greedy insertion (`repairGreedy`).
-- **Acceptance**: always accept on reduced fleet size or distance; SA-style probabilistic
-  acceptance in `-algorithm sa` mode; random destroys always accepted to keep exploring.
+- **Acceptance**: always accept on reduced fleet size or distance; random destroys always accepted
+  to keep exploring.
 - **Stagnation intervention**: after `-llm-threshold` iterations with no improvement, destroys
   2–5 routes and re-solves the freed customers, escalating destroy size across up to 3 attempts if
   it doesn't improve. Route re-solving is either the pure-Go heuristic

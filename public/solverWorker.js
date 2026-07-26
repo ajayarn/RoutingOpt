@@ -226,7 +226,6 @@ self.onmessage = async (event) => {
       "js",
       "-file", "/instance.txt",
       "-iterations", String(args.iterations),
-      "-algorithm", args.algorithm,
       "-llm-threshold", String(args.llmThreshold),
       "-seed", String(args.seed),
       `-use-lkh=${!!args.useLkh}`,

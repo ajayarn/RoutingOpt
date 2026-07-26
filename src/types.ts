@@ -36,7 +36,6 @@ export interface SolverSolution {
 }
 
 export interface SolverParams {
-  algorithm: 'ga' | 'lns' | 'sa';
   maxIterations: number;
   populationSize?: number;
   mutationRate?: number;
