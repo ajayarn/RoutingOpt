@@ -89,3 +89,30 @@ func TestDestroyRouteEliminationRemovesWholeRouteOnly(t *testing.T) {
 		t.Fatalf("destroyRouteElimination() mutated its input: %+v", original.Routes)
 	}
 }
+
+func TestDestroyRouteEliminationDoesNotAliasRetainedRoutesCustomerIDs(t *testing.T) {
+	customers := testCustomers()
+	depot := testDepot()
+	capacity := 10.0
+
+	original := Solution{Routes: []Route{
+		buildRoute(t, []int{1}, 1, customers, depot, capacity),
+		buildRoute(t, []int{2}, 2, customers, depot, capacity),
+	}}
+
+	partialSol, _ := destroyRouteElimination(original, 0)
+
+	// Mutate the retained route's CustomerIDs slice element directly. If
+	// destroyRouteElimination aliased the original's backing array instead
+	// of deep-copying it (via cloneSolution), this write would be visible
+	// through `original` too - this is the property repairGreedy's
+	// in-place append-based insertion (solver/main.go) would otherwise
+	// silently violate on any route whose CustomerIDs slice has spare
+	// capacity (the normal case for routes built via repeated
+	// single-element appends elsewhere in this file).
+	partialSol.Routes[0].CustomerIDs[0] = 999
+
+	if original.Routes[1].CustomerIDs[0] != 2 {
+		t.Fatalf("destroyRouteElimination() aliased the retained route's CustomerIDs backing array: original.Routes[1].CustomerIDs[0] = %d, want 2 (unaffected by mutating partialSol)", original.Routes[1].CustomerIDs[0])
+	}
+}

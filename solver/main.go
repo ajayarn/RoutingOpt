@@ -984,12 +984,28 @@ func destroyRandom(sol Solution, k int, customers map[int]Customer, depot Custom
 // that was evicted. Same (Solution, []int) shape as
 // destroyWorst/destroyRandom, but always empties one whole route rather
 // than a random k customers scattered across many routes.
+//
+// Builds the retained routes from cloneSolution(sol) rather than copying
+// sol.Routes directly: a plain range-copy only copies each Route struct by
+// value, but CustomerIDs (and the time maps) are reference types, so the
+// copy would still alias sol's original backing arrays. Since routes are
+// built incrementally via single-element appends elsewhere in this file,
+// their CustomerIDs slices routinely end up with spare capacity (Go's
+// append growth strategy over-allocates) - a later in-place append onto an
+// aliased slice (as repairGreedy's insertion does) can silently corrupt
+// sol's original data even though sol itself is never directly assigned
+// to. cloneSolution already deep-copies every route's CustomerIDs and time
+// maps, so starting from it guarantees the caller's sol stays pristine
+// across repeated destroy/repair attempts against it (see tryRouteElimination,
+// Task 7, which relies on exactly this to retry against the same original
+// sol when one attempt fails).
 func destroyRouteElimination(sol Solution, routeIdx int) (Solution, []int) {
 	removed := make([]int, len(sol.Routes[routeIdx].CustomerIDs))
 	copy(removed, sol.Routes[routeIdx].CustomerIDs)
 
-	newRoutes := make([]Route, 0, len(sol.Routes)-1)
-	for i, r := range sol.Routes {
+	cloned := cloneSolution(sol)
+	newRoutes := make([]Route, 0, len(cloned.Routes)-1)
+	for i, r := range cloned.Routes {
 		if i != routeIdx {
 			newRoutes = append(newRoutes, r)
 		}
