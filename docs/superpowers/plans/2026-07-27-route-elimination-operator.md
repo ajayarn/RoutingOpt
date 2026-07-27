@@ -645,6 +645,56 @@ func TestRepairGreedyNoNewRouteFailsWithoutMutatingInput(t *testing.T) {
 		t.Fatalf("repairGreedyNoNewRoute() mutated its input: %+v", sol.Routes)
 	}
 }
+
+// TestRepairGreedyNoNewRouteDoesNotPartiallyCommitOnLaterFailure covers a
+// case the test above does not: more than one customer in `removed`, where
+// the first is feasible and gets inserted before a later one turns out to
+// have nowhere left to go. Because `sol.Routes` is a slice, passing sol by
+// value only copies the slice header - `sol.Routes[i] = ...` still writes
+// through to the same backing array the caller's Solution literal owns, so
+// an implementation that mutates sol.Routes directly (instead of a
+// cloneSolution copy) can commit the first customer's insertion into the
+// caller's own routes *before* discovering the second customer is
+// infeasible and returning ok=false. That violates "no partial commit"
+// even though the single-customer case above never triggers it.
+func TestRepairGreedyNoNewRouteDoesNotPartiallyCommitOnLaterFailure(t *testing.T) {
+	customers := map[int]Customer{
+		0: {ID: 0, X: 0, Y: 0, Demand: 0, ReadyTime: 0, DueDate: 1000, ServiceTime: 0},
+		1: {ID: 1, X: 1, Y: 0, Demand: 10, ReadyTime: 0, DueDate: 1000, ServiceTime: 0},
+		2: {ID: 2, X: 2, Y: 0, Demand: 6, ReadyTime: 0, DueDate: 1000, ServiceTime: 0},
+		3: {ID: 3, X: 3, Y: 0, Demand: 5, ReadyTime: 0, DueDate: 1000, ServiceTime: 0},
+	}
+	depot := testDepot()
+	capacity := 10.0
+
+	original := Solution{Routes: []Route{
+		buildRoute(t, []int{1}, 1, customers, depot, capacity), // demand 10, no room left
+		{VehicleID: 2, CustomerIDs: []int{}},                   // empty route, room for 10
+	}}
+	recalculateSolutionMetrics(&original)
+
+	// Customer 2 (demand 6) and customer 3 (demand 5) both individually fit
+	// in the empty route2 (room 10), but not together (6+5=11 > 10) - and
+	// route1 has no room for either. So whichever is inserted first
+	// "succeeds" locally, but the attempt as a whole must still fail once
+	// the second customer is found to have nowhere left to go.
+	result, ok := repairGreedyNoNewRoute(original, []int{2, 3}, customers, depot, capacity)
+	if ok {
+		t.Fatalf("repairGreedyNoNewRoute() returned ok=true, want false (customers 2 and 3 together can't fit in the only open room)")
+	}
+
+	// The returned Solution must not be a partially-repaired one: route2
+	// must still be empty, not holding whichever of {2,3} got inserted
+	// before the failure was discovered.
+	if len(result.Routes) != 2 || len(result.Routes[1].CustomerIDs) != 0 {
+		t.Fatalf("repairGreedyNoNewRoute() returned a partially-committed solution on failure: %+v", result.Routes)
+	}
+
+	// The original argument must also be untouched.
+	if len(original.Routes) != 2 || len(original.Routes[1].CustomerIDs) != 0 {
+		t.Fatalf("repairGreedyNoNewRoute() mutated its input on failure: %+v", original.Routes)
+	}
+}
 ```
 
 - [ ] **Step 2: Run tests to verify they fail**
@@ -668,6 +718,15 @@ Expected: FAIL with `undefined: repairGreedyNoNewRoute`
 // repairGreedy's random insertion order almost never manages a full-route
 // reinsertion.
 func repairGreedyNoNewRoute(sol Solution, removed []int, customers map[int]Customer, depot Customer, capacity float64) (Solution, bool) {
+	// Work on a clone throughout, exactly like destroyRouteElimination
+	// (Task 4) had to: Solution.Routes is a slice, so mutating sol.Routes
+	// directly would write through to the caller's original even though
+	// sol was passed by value. Without this, a customer placed
+	// successfully earlier in this call could still be visible in sol
+	// after a LATER customer's failure forces this function to return
+	// ok=false - a partial commit the caller must never see.
+	working := cloneSolution(sol)
+
 	remaining := make(map[int]bool, len(removed))
 	for _, cID := range removed {
 		remaining[cID] = true
@@ -680,17 +739,15 @@ func repairGreedyNoNewRoute(sol Solution, removed []int, customers map[int]Custo
 		bestSlotCount := -1
 
 		for cID := range remaining {
-			routeIdx, pos, _, slotCount, feasible := findBestInsertion(sol.Routes, cID, customers, depot, capacity)
+			routeIdx, pos, _, slotCount, feasible := findBestInsertion(working.Routes, cID, customers, depot, capacity)
 			if !feasible {
 				// This customer has nowhere feasible to go in the existing
-				// routes - the whole elimination attempt fails. Any
-				// customers already placed earlier in this call were
-				// written into fresh, freshly-allocated CustomerIDs slices
-				// (see findBestInsertion/calculateRouteDetails), never
-				// back into sol's original backing arrays, so returning
-				// sol here (unmodified from the caller's perspective) is
-				// safe - see Task 6 test
-				// TestRepairGreedyNoNewRouteFailsWithoutMutatingInput.
+				// routes - the whole elimination attempt fails. Every
+				// insertion made so far in this call went into `working`,
+				// never into `sol`, so `sol` (the caller's original,
+				// returned here unchanged) was never written through - see
+				// TestRepairGreedyNoNewRouteFailsWithoutMutatingInput and
+				// TestRepairGreedyNoNewRouteDoesNotPartiallyCommitOnLaterFailure.
 				return sol, false
 			}
 
@@ -702,7 +759,7 @@ func repairGreedyNoNewRoute(sol Solution, removed []int, customers map[int]Custo
 			}
 		}
 
-		r := &sol.Routes[bestRouteIdx]
+		r := &working.Routes[bestRouteIdx]
 		newIDs := make([]int, len(r.CustomerIDs)+1)
 		copy(newIDs[:bestPos], r.CustomerIDs[:bestPos])
 		newIDs[bestPos] = bestCustID
@@ -710,18 +767,27 @@ func repairGreedyNoNewRoute(sol Solution, removed []int, customers map[int]Custo
 
 		rDetails, _ := calculateRouteDetails(newIDs, customers, depot, capacity)
 		rDetails.VehicleID = r.VehicleID
-		sol.Routes[bestRouteIdx] = rDetails
+		working.Routes[bestRouteIdx] = rDetails
 
 		delete(remaining, bestCustID)
 	}
 
-	for idx := range sol.Routes {
-		sol.Routes[idx].VehicleID = idx + 1
+	for idx := range working.Routes {
+		working.Routes[idx].VehicleID = idx + 1
 	}
-	recalculateSolutionMetrics(&sol)
-	return sol, true
+	recalculateSolutionMetrics(&working)
+	return working, true
 }
 ```
+
+**Note:** the first implementation of this task independently discovered that
+the reference code above (before the `working := cloneSolution(sol)` line
+was added) had the exact same class of aliasing bug Task 4's
+`destroyRouteElimination` had — writing through `sol.Routes[i]` mutates the
+caller's original `Solution` even though `sol` was passed by value, since
+`Routes` is a slice. The code above already has that fix folded in; if
+you're implementing this task fresh, use it as shown rather than dropping
+the `working` copy as an "optimization."
 
 - [ ] **Step 4: Run tests to verify they pass**
 
