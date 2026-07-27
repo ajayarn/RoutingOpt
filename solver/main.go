@@ -1091,6 +1091,73 @@ func repairGreedy(sol Solution, removed []int, customers map[int]Customer, depot
 	return sol
 }
 
+// repairGreedyNoNewRoute attempts to reinsert every customer in `removed`
+// into sol's existing routes only - it may never open a new route. Returns
+// ok=false (sol returned unchanged, no partial commit) if any customer
+// cannot be placed feasibly.
+//
+// Insertion order is most-constrained-first, recomputed dynamically before
+// each insertion: whichever not-yet-placed customer currently has the
+// fewest feasible (route, position) slots (findBestInsertion's slotCount)
+// goes next. This matters because inserting "easy" customers first can
+// consume the capacity/time slack a "hard" customer needed - exactly why
+// repairGreedy's random insertion order almost never manages a full-route
+// reinsertion.
+func repairGreedyNoNewRoute(sol Solution, removed []int, customers map[int]Customer, depot Customer, capacity float64) (Solution, bool) {
+	remaining := make(map[int]bool, len(removed))
+	for _, cID := range removed {
+		remaining[cID] = true
+	}
+
+	for len(remaining) > 0 {
+		bestCustID := -1
+		bestRouteIdx := -1
+		bestPos := -1
+		bestSlotCount := -1
+
+		for cID := range remaining {
+			routeIdx, pos, _, slotCount, feasible := findBestInsertion(sol.Routes, cID, customers, depot, capacity)
+			if !feasible {
+				// This customer has nowhere feasible to go in the existing
+				// routes - the whole elimination attempt fails. Any
+				// customers already placed earlier in this call were
+				// written into fresh, freshly-allocated CustomerIDs slices
+				// (see findBestInsertion/calculateRouteDetails), never
+				// back into sol's original backing arrays, so returning
+				// sol here (unmodified from the caller's perspective) is
+				// safe - see Task 6 test
+				// TestRepairGreedyNoNewRouteFailsWithoutMutatingInput.
+				return sol, false
+			}
+
+			if bestSlotCount == -1 || slotCount < bestSlotCount {
+				bestSlotCount = slotCount
+				bestCustID = cID
+				bestRouteIdx = routeIdx
+				bestPos = pos
+			}
+		}
+
+		r := &sol.Routes[bestRouteIdx]
+		newIDs := make([]int, len(r.CustomerIDs)+1)
+		copy(newIDs[:bestPos], r.CustomerIDs[:bestPos])
+		newIDs[bestPos] = bestCustID
+		copy(newIDs[bestPos+1:], r.CustomerIDs[bestPos:])
+
+		rDetails, _ := calculateRouteDetails(newIDs, customers, depot, capacity)
+		rDetails.VehicleID = r.VehicleID
+		sol.Routes[bestRouteIdx] = rDetails
+
+		delete(remaining, bestCustID)
+	}
+
+	for idx := range sol.Routes {
+		sol.Routes[idx].VehicleID = idx + 1
+	}
+	recalculateSolutionMetrics(&sol)
+	return sol, true
+}
+
 func cloneSolution(sol Solution) Solution {
 	clonedRoutes := make([]Route, len(sol.Routes))
 	for i, r := range sol.Routes {

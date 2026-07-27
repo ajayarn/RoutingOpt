@@ -159,3 +159,64 @@ func TestRepairGreedyBehaviorUnchangedByRefactor(t *testing.T) {
 		t.Fatalf("repairGreedy() did not open a new route when nothing fit: got %d routes, want 2", len(result2.Routes))
 	}
 }
+
+func TestRepairGreedyNoNewRouteReinsertsWithoutOpeningNewRoute(t *testing.T) {
+	customers := testCustomers()
+	depot := testDepot()
+	capacity := 10.0
+
+	sol := Solution{Routes: []Route{
+		buildRoute(t, []int{2}, 1, customers, depot, capacity), // demand 5, room for 5 more
+		buildRoute(t, []int{3}, 2, customers, depot, capacity), // demand 5, room for 5 more
+	}}
+	recalculateSolutionMetrics(&sol)
+
+	result, ok := repairGreedyNoNewRoute(sol, []int{1}, customers, depot, capacity)
+	if !ok {
+		t.Fatalf("repairGreedyNoNewRoute() returned ok=false, want true (customer 1 fits in either existing route)")
+	}
+	if len(result.Routes) != 2 {
+		t.Fatalf("repairGreedyNoNewRoute() opened a new route: got %d routes, want 2", len(result.Routes))
+	}
+
+	seen := map[int]bool{}
+	for _, r := range result.Routes {
+		for _, cID := range r.CustomerIDs {
+			seen[cID] = true
+		}
+		if r.Load > capacity {
+			t.Fatalf("repairGreedyNoNewRoute() produced an over-capacity route: load %.1f > %.1f", r.Load, capacity)
+		}
+	}
+	for _, want := range []int{1, 2, 3} {
+		if !seen[want] {
+			t.Fatalf("repairGreedyNoNewRoute() result is missing customer %d: %+v", want, result.Routes)
+		}
+	}
+}
+
+func TestRepairGreedyNoNewRouteFailsWithoutMutatingInput(t *testing.T) {
+	customers := testCustomers()
+	depot := testDepot()
+	capacity := 10.0
+
+	sol := Solution{Routes: []Route{
+		buildRoute(t, []int{1}, 1, customers, depot, capacity), // demand 5, only 5 of room left
+	}}
+	recalculateSolutionMetrics(&sol)
+
+	// Customer 4 has demand 9; 5 (existing) + 9 > capacity 10, so it cannot
+	// fit in the only existing route - the attempt must fail outright.
+	result, ok := repairGreedyNoNewRoute(sol, []int{4}, customers, depot, capacity)
+	if ok {
+		t.Fatalf("repairGreedyNoNewRoute() returned ok=true, want false (customer 4 cannot fit)")
+	}
+	if len(result.Routes) != 1 || len(result.Routes[0].CustomerIDs) != 1 || result.Routes[0].CustomerIDs[0] != 1 {
+		t.Fatalf("repairGreedyNoNewRoute() returned a mutated solution on failure: %+v", result.Routes)
+	}
+
+	// The original sol argument itself must also be untouched.
+	if len(sol.Routes) != 1 || len(sol.Routes[0].CustomerIDs) != 1 || sol.Routes[0].CustomerIDs[0] != 1 {
+		t.Fatalf("repairGreedyNoNewRoute() mutated its input: %+v", sol.Routes)
+	}
+}
