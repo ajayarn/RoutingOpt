@@ -814,6 +814,40 @@ func minVehiclesLowerBound(customers map[int]Customer, capacity float64) int {
 	return bound
 }
 
+// selectWeakestRoutes ranks route indices ascending by "how easy this route
+// is to eliminate" - fewest customers first (fewest things needing a new
+// home), tie-broken by lowest total demand (most likely to fit into other
+// routes' remaining capacity).
+func selectWeakestRoutes(sol Solution, customers map[int]Customer) []int {
+	type routeWeight struct {
+		idx    int
+		count  int
+		demand float64
+	}
+
+	weights := make([]routeWeight, len(sol.Routes))
+	for i, r := range sol.Routes {
+		d := 0.0
+		for _, cID := range r.CustomerIDs {
+			d += customers[cID].Demand
+		}
+		weights[i] = routeWeight{idx: i, count: len(r.CustomerIDs), demand: d}
+	}
+
+	sort.Slice(weights, func(i, j int) bool {
+		if weights[i].count != weights[j].count {
+			return weights[i].count < weights[j].count
+		}
+		return weights[i].demand < weights[j].demand
+	})
+
+	ranked := make([]int, len(weights))
+	for i, w := range weights {
+		ranked[i] = w.idx
+	}
+	return ranked
+}
+
 // LNS Destroy: Remove worst-performing customers
 func destroyWorst(sol Solution, k int, customers map[int]Customer, depot Customer) (Solution, []int) {
 	type CostRecord struct {
