@@ -270,3 +270,87 @@ func TestRepairGreedyNoNewRouteDoesNotPartiallyCommitOnLaterFailure(t *testing.T
 		t.Fatalf("repairGreedyNoNewRoute() mutated its input on failure: %+v", original.Routes)
 	}
 }
+
+func TestTryRouteEliminationReducesVehicleCount(t *testing.T) {
+	customers := testCustomers()
+	depot := testDepot()
+	capacity := 10.0
+
+	sol := Solution{Routes: []Route{
+		buildRoute(t, []int{1}, 1, customers, depot, capacity), // demand 5
+		buildRoute(t, []int{2}, 2, customers, depot, capacity), // demand 5
+		buildRoute(t, []int{3}, 3, customers, depot, capacity), // demand 5
+		buildRoute(t, []int{4}, 4, customers, depot, capacity), // demand 9
+	}}
+	recalculateSolutionMetrics(&sol)
+
+	result, ok := tryRouteElimination(sol, customers, depot, capacity, 3)
+	if !ok {
+		t.Fatalf("tryRouteElimination() returned ok=false, want true (two demand-5 routes should merge)")
+	}
+	if result.TotalVehicles != 3 {
+		t.Fatalf("tryRouteElimination() left %d vehicles, want 3", result.TotalVehicles)
+	}
+
+	lowerBound := minVehiclesLowerBound(customers, capacity)
+	if lowerBound != 3 {
+		t.Fatalf("test assumption broken: lower bound = %d, want 3", lowerBound)
+	}
+
+	// Now at the capacity lower bound - a further attempt must short-circuit.
+	_, ok = tryRouteElimination(result, customers, depot, capacity, 3)
+	if ok {
+		t.Fatalf("tryRouteElimination() succeeded again at the capacity lower bound - should have short-circuited")
+	}
+}
+
+func TestTryRouteEliminationShortCircuitsAtLowerBound(t *testing.T) {
+	customers := map[int]Customer{
+		0: {ID: 0, X: 0, Y: 0, Demand: 0, ReadyTime: 0, DueDate: 1000},
+		1: {ID: 1, X: 1, Y: 0, Demand: 5, ReadyTime: 0, DueDate: 100},
+	}
+	depot := customers[0]
+	capacity := 10.0 // lower bound = ceil(5/10) = 1
+
+	sol := Solution{Routes: []Route{
+		buildRoute(t, []int{1}, 1, customers, depot, capacity),
+	}}
+	recalculateSolutionMetrics(&sol)
+
+	result, ok := tryRouteElimination(sol, customers, depot, capacity, 3)
+	if ok {
+		t.Fatalf("tryRouteElimination() returned ok=true, want false - already at the 1-vehicle capacity floor")
+	}
+	if result.TotalVehicles != 1 {
+		t.Fatalf("tryRouteElimination() changed vehicle count: got %d, want 1", result.TotalVehicles)
+	}
+}
+
+func TestTryRouteEliminationFailsWhenTimeWindowsPreventMerging(t *testing.T) {
+	depot := Customer{ID: 0, X: 0, Y: 0, Demand: 0, ReadyTime: 0, DueDate: 1000, ServiceTime: 0}
+	custA := Customer{ID: 1, X: 40, Y: 0, Demand: 1, ReadyTime: 0, DueDate: 40, ServiceTime: 0}
+	custB := Customer{ID: 2, X: 0, Y: 40, Demand: 1, ReadyTime: 0, DueDate: 40, ServiceTime: 0}
+	customers := map[int]Customer{0: depot, 1: custA, 2: custB}
+	capacity := 100.0
+
+	sol := Solution{Routes: []Route{
+		buildRoute(t, []int{1}, 1, customers, depot, capacity),
+		buildRoute(t, []int{2}, 2, customers, depot, capacity),
+	}}
+	recalculateSolutionMetrics(&sol)
+
+	if lb := minVehiclesLowerBound(customers, capacity); sol.TotalVehicles <= lb {
+		t.Fatalf("test setup invalid: TotalVehicles=%d must be > lower bound=%d so the short-circuit doesn't mask the real repair failure", sol.TotalVehicles, lb)
+	}
+
+	result, ok := tryRouteElimination(sol, customers, depot, capacity, 3)
+	if ok {
+		t.Fatalf("tryRouteElimination() returned ok=true, want false - the two customers' time windows make merging infeasible in both orders")
+	}
+	if result.TotalVehicles != 2 {
+		t.Fatalf("tryRouteElimination() changed vehicle count on failure: got %d, want 2", result.TotalVehicles)
+	}
+	if len(sol.Routes) != 2 || len(sol.Routes[0].CustomerIDs) != 1 || len(sol.Routes[1].CustomerIDs) != 1 {
+		t.Fatalf("tryRouteElimination() mutated its input on failure: %+v", sol.Routes)
+	}
+}

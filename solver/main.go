@@ -1172,6 +1172,33 @@ func repairGreedyNoNewRoute(sol Solution, removed []int, customers map[int]Custo
 	return working, true
 }
 
+// tryRouteElimination attempts to eliminate a route, trying up to
+// maxAttempts of the weakest routes (in order, see selectWeakestRoutes)
+// before giving up. Returns ok=false (sol unchanged) if none succeed, or
+// immediately if sol's vehicle count already equals the capacity lower
+// bound - no point attempting further reduction. Bounds cost the same way
+// the existing stagnation heuristic bounds its maxAttempts=3 retries.
+func tryRouteElimination(sol Solution, customers map[int]Customer, depot Customer, capacity float64, maxAttempts int) (Solution, bool) {
+	if sol.TotalVehicles <= minVehiclesLowerBound(customers, capacity) {
+		return sol, false
+	}
+
+	ranked := selectWeakestRoutes(sol, customers)
+	if maxAttempts > len(ranked) {
+		maxAttempts = len(ranked)
+	}
+
+	for i := 0; i < maxAttempts; i++ {
+		partialSol, removed := destroyRouteElimination(sol, ranked[i])
+		repaired, ok := repairGreedyNoNewRoute(partialSol, removed, customers, depot, capacity)
+		if ok {
+			return repaired, true
+		}
+	}
+
+	return sol, false
+}
+
 func cloneSolution(sol Solution) Solution {
 	clonedRoutes := make([]Route, len(sol.Routes))
 	for i, r := range sol.Routes {
