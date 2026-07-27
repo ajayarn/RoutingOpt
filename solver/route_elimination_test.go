@@ -41,6 +41,36 @@ func buildRoute(t *testing.T, ids []int, vehicleID int, customers map[int]Custom
 	return r
 }
 
+// customerIDCounts returns a count of every customer ID appearing across all
+// routes' CustomerIDs - a multiset, not a set, so it can catch both a
+// dropped customer (count goes from 1 to 0) and a duplicated one (count goes
+// from 1 to 2), unlike a map[int]bool "seen" check.
+func customerIDCounts(routes []Route) map[int]int {
+	counts := make(map[int]int)
+	for _, r := range routes {
+		for _, cID := range r.CustomerIDs {
+			counts[cID]++
+		}
+	}
+	return counts
+}
+
+// assertSameCustomerMultiset fails the test if got and want don't contain
+// exactly the same customer IDs with the same multiplicities.
+func assertSameCustomerMultiset(t *testing.T, label string, got, want map[int]int) {
+	t.Helper()
+	for id, wantCount := range want {
+		if got[id] != wantCount {
+			t.Fatalf("%s: customer %d appears %d time(s), want %d (got=%v, want=%v)", label, id, got[id], wantCount, got, want)
+		}
+	}
+	for id, gotCount := range got {
+		if want[id] != gotCount {
+			t.Fatalf("%s: customer %d appears %d time(s), want %d (got=%v, want=%v)", label, id, gotCount, want[id], got, want)
+		}
+	}
+}
+
 func TestSelectWeakestRoutesRanksLowestDemandFirst(t *testing.T) {
 	customers := testCustomers()
 	depot := testDepot()
@@ -174,7 +204,16 @@ func TestRepairGreedyNoNewRouteReinsertsWithoutOpeningNewRoute(t *testing.T) {
 	}}
 	recalculateSolutionMetrics(&sol)
 
-	result, ok := repairGreedyNoNewRoute(sol, []int{1}, customers, depot, capacity)
+	// Baseline: whatever was already routed in sol, plus what's being
+	// reinserted, is exactly what the result must contain - no more, no
+	// less.
+	removed := []int{1}
+	wantCounts := customerIDCounts(sol.Routes)
+	for _, cID := range removed {
+		wantCounts[cID]++
+	}
+
+	result, ok := repairGreedyNoNewRoute(sol, removed, customers, depot, capacity)
 	if !ok {
 		t.Fatalf("repairGreedyNoNewRoute() returned ok=false, want true (customer 1 fits in either existing route)")
 	}
@@ -196,6 +235,9 @@ func TestRepairGreedyNoNewRouteReinsertsWithoutOpeningNewRoute(t *testing.T) {
 			t.Fatalf("repairGreedyNoNewRoute() result is missing customer %d: %+v", want, result.Routes)
 		}
 	}
+
+	// No customer silently dropped or duplicated across the repair.
+	assertSameCustomerMultiset(t, "repairGreedyNoNewRoute() customer conservation", customerIDCounts(result.Routes), wantCounts)
 }
 
 func TestRepairGreedyNoNewRouteFailsWithoutMutatingInput(t *testing.T) {
@@ -286,6 +328,7 @@ func TestTryRouteEliminationReducesVehicleCount(t *testing.T) {
 		buildRoute(t, []int{4}, 4, customers, depot, capacity), // demand 9
 	}}
 	recalculateSolutionMetrics(&sol)
+	wantCounts := customerIDCounts(sol.Routes)
 
 	result, ok := tryRouteElimination(sol, customers, depot, capacity, 3)
 	if !ok {
@@ -294,6 +337,9 @@ func TestTryRouteEliminationReducesVehicleCount(t *testing.T) {
 	if result.TotalVehicles != 3 {
 		t.Fatalf("tryRouteElimination() left %d vehicles, want 3", result.TotalVehicles)
 	}
+
+	// A successful elimination must not silently drop or duplicate a customer.
+	assertSameCustomerMultiset(t, "tryRouteElimination() customer conservation", customerIDCounts(result.Routes), wantCounts)
 
 	lowerBound := minVehiclesLowerBound(customers, capacity)
 	if lowerBound != 3 {
@@ -304,6 +350,63 @@ func TestTryRouteEliminationReducesVehicleCount(t *testing.T) {
 	_, ok = tryRouteElimination(result, customers, depot, capacity, 3)
 	if ok {
 		t.Fatalf("tryRouteElimination() succeeded again at the capacity lower bound - should have short-circuited")
+	}
+}
+
+// TestTryRouteEliminationShortCircuitStopsEvenWhenMergePossible distinguishes
+// the minVehiclesLowerBound short-circuit from an ordinary repair failure.
+// Every other short-circuit test's fixture happens to also fail the
+// destroy+repair attempt on its own (capacity infeasibility right at the
+// bound), so deleting the short-circuit line wouldn't change their outcome -
+// this test's fixture is built so the merge would actually SUCCEED if
+// attempted, proving the short-circuit itself is doing real work.
+//
+// customer 5 (demand 8) is deliberately never placed into any route - it
+// exists only so minVehiclesLowerBound (which sums demand across the whole
+// `customers` map, independent of what's actually routed in `sol`) computes
+// a bound of 2 that matches sol.TotalVehicles, even though the two routed
+// customers (1 and 2, demand 3 each) could easily share one vehicle. Don't
+// "clean up" customer 5 as dead fixture data - it's load-bearing.
+func TestTryRouteEliminationShortCircuitStopsEvenWhenMergePossible(t *testing.T) {
+	customers := map[int]Customer{
+		0: {ID: 0, X: 0, Y: 0, Demand: 0, ReadyTime: 0, DueDate: 1000},
+		1: {ID: 1, X: 1, Y: 0, Demand: 3, ReadyTime: 0, DueDate: 1000},
+		2: {ID: 2, X: 2, Y: 0, Demand: 3, ReadyTime: 0, DueDate: 1000},
+		5: {ID: 5, X: 100, Y: 100, Demand: 8, ReadyTime: 0, DueDate: 1000}, // unrouted; see comment above
+	}
+	depot := customers[0]
+	capacity := 10.0 // total demand across the map: 3+3+8=14, ceil(14/10)=2
+
+	sol := Solution{Routes: []Route{
+		buildRoute(t, []int{1}, 1, customers, depot, capacity), // demand 3
+		buildRoute(t, []int{2}, 2, customers, depot, capacity), // demand 3
+	}}
+	recalculateSolutionMetrics(&sol)
+
+	if got := minVehiclesLowerBound(customers, capacity); got != 2 {
+		t.Fatalf("test assumption broken: lower bound = %d, want 2", got)
+	}
+	if sol.TotalVehicles != 2 {
+		t.Fatalf("test assumption broken: sol.TotalVehicles = %d, want 2", sol.TotalVehicles)
+	}
+
+	// Positive control: prove the merge really would succeed without the
+	// short-circuit, by driving destroy+repair directly. If this ever starts
+	// failing, the fixture no longer discriminates and needs revisiting.
+	partialSol, removed := destroyRouteElimination(sol, 0)
+	if _, ok := repairGreedyNoNewRoute(partialSol, removed, customers, depot, capacity); !ok {
+		t.Fatalf("test fixture broken: destroy+repair of route 0 should succeed (routes 1 and 2 together fit comfortably under capacity %v), but repairGreedyNoNewRoute returned ok=false", capacity)
+	}
+
+	result, ok := tryRouteElimination(sol, customers, depot, capacity, 3)
+	if ok {
+		t.Fatalf("tryRouteElimination() returned ok=true, want false - already at the capacity lower bound (2), short-circuit should have stopped it before attempting the merge")
+	}
+	if result.TotalVehicles != 2 || len(result.Routes) != 2 {
+		t.Fatalf("tryRouteElimination() changed the solution despite the short-circuit: %+v", result.Routes)
+	}
+	if len(sol.Routes) != 2 || len(sol.Routes[0].CustomerIDs) != 1 || len(sol.Routes[1].CustomerIDs) != 1 {
+		t.Fatalf("tryRouteElimination() mutated its input: %+v", sol.Routes)
 	}
 }
 

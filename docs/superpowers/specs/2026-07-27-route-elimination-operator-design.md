@@ -140,9 +140,9 @@ LNS loop starts, run a dedicated pre-phase: repeatedly call
 `tryRouteElimination` against the current solution (accepting every success
 unconditionally — fewer vehicles always wins), continuing until either:
 
-- it stalls (a full pass through `selectWeakestRoutes` produces no
-  successful elimination — i.e. `tryRouteElimination` exhausted `maxAttempts`
-  and failed), or
+- it stalls (`tryRouteElimination` fails to eliminate any of the
+  `maxAttempts` (3) weakest routes — not a full pass over every route via
+  `selectWeakestRoutes`, only the top `maxAttempts` of its ranking), or
 - `len(sol.Routes) == minVehiclesLowerBound(...)` (capacity-optimal, section 1), or
 - the pre-phase's iteration budget is exhausted.
 

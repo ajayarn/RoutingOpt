@@ -184,8 +184,19 @@ this file's history were wrong (rc201's was actually rc103's value).
 ## Solver algorithm (Go path, `solver/main.go` — the one the web app runs, via WASM)
 
 - **Initial solution**: K-means clustering + insertion (`buildInitialSolution`).
-- **Destroy operators**: worst-distance and random removal (`destroyWorst`/`destroyRandom`).
-- **Repair**: greedy insertion (`repairGreedy`).
+- **Vehicle-minimization pre-phase**: immediately after construction, before the main loop,
+  repeatedly calls `tryRouteElimination` to shed routes while the solution is still loose.
+  Budgeted at 10% of `-iterations`, logged under the `VEHICLE-MIN` category. See
+  `docs/superpowers/specs/2026-07-27-route-elimination-operator-design.md` for why this runs
+  up front rather than only reactively.
+- **Destroy operators**: worst-distance and random removal (`destroyWorst`/`destroyRandom`), plus
+  Route Elimination (`destroyRouteElimination` + `repairGreedyNoNewRoute`, orchestrated by
+  `tryRouteElimination`) - fired 20% of the time in the main loop (vs. 40%/40% for
+  Worst/Random; see `chooseDestroyOperator`). Route Elimination exists because the other two
+  operators can't reliably reduce vehicle count on their own.
+- **Repair**: greedy insertion (`repairGreedy`); Route Elimination uses
+  `repairGreedyNoNewRoute` instead (reinsertion into existing routes only, never opens a new
+  one).
 - **Acceptance**: always accept on reduced fleet size or distance; random destroys always accepted
   to keep exploring.
 - **Stagnation intervention**: after `-llm-threshold` iterations with no improvement, destroys

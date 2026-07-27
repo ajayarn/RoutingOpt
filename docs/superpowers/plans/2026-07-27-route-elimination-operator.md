@@ -1166,10 +1166,13 @@ Expected: FAIL with `undefined: runVehicleMinimizationPrePhase`
 // distance-optimized) - see
 // docs/superpowers/specs/2026-07-27-route-elimination-operator-design.md
 // for why this runs up front rather than only reactively. Stops as soon as
-// any of the following happens: a route-elimination attempt fails
-// (deterministic given the same solution, so retrying immediately can't
-// succeed), the capacity lower bound is reached, or budget attempts are
-// used up.
+// any of the following happens: a route-elimination attempt fails (this is
+// NOT proof no further reduction is possible - repairGreedyNoNewRoute picks
+// its insertion order via Go map iteration, which is runtime-randomized
+// even under a fixed -seed, so an immediate retry against the identical
+// solution could still succeed; stopping here is a deliberate cost bound,
+// not a correctness guarantee), the capacity lower bound is reached, or
+// budget attempts are used up.
 func runVehicleMinimizationPrePhase(sol Solution, customers map[int]Customer, depot Customer, capacity float64, budget int, startTime time.Time) Solution {
 	lowerBound := minVehiclesLowerBound(customers, capacity)
 
