@@ -1016,6 +1016,41 @@ func destroyRouteElimination(sol Solution, routeIdx int) (Solution, []int) {
 	return partialSol, removed
 }
 
+// findBestInsertion searches every (route, position) pair across routes for
+// the cheapest feasible place to insert customer cID, and also counts how
+// many positions are feasible in total (slotCount) - used by
+// repairGreedyNoNewRoute's most-constrained-first ordering. Shared by
+// repairGreedy and repairGreedyNoNewRoute so this insertion-cost search
+// exists in exactly one place.
+func findBestInsertion(routes []Route, cID int, customers map[int]Customer, depot Customer, capacity float64) (routeIdx int, pos int, cost float64, slotCount int, feasible bool) {
+	routeIdx = -1
+	pos = -1
+	cost = 1e9
+
+	for rIdx, r := range routes {
+		for p := 0; p <= len(r.CustomerIDs); p++ {
+			testRoute := make([]int, len(r.CustomerIDs)+1)
+			copy(testRoute[:p], r.CustomerIDs[:p])
+			testRoute[p] = cID
+			copy(testRoute[p+1:], r.CustomerIDs[p:])
+
+			rDetails, ok := calculateRouteDetails(testRoute, customers, depot, capacity)
+			if ok {
+				slotCount++
+				c := rDetails.Distance - r.Distance
+				if c < cost {
+					cost = c
+					routeIdx = rIdx
+					pos = p
+					feasible = true
+				}
+			}
+		}
+	}
+
+	return routeIdx, pos, cost, slotCount, feasible
+}
+
 // LNS Repair: Greedy Insertion with Best Fit Time-Window Feasibility
 func repairGreedy(sol Solution, removed []int, customers map[int]Customer, depot Customer, capacity float64) Solution {
 	// Shuffle removed list to avoid order bias
@@ -1024,31 +1059,10 @@ func repairGreedy(sol Solution, removed []int, customers map[int]Customer, depot
 	})
 
 	for _, cID := range removed {
-		bestRouteIdx := -1
-		bestPos := -1
-		bestInsertCost := 1e9
-
-		for rIdx, r := range sol.Routes {
-			for pos := 0; pos <= len(r.CustomerIDs); pos++ {
-				testRoute := make([]int, len(r.CustomerIDs)+1)
-				copy(testRoute[:pos], r.CustomerIDs[:pos])
-				testRoute[pos] = cID
-				copy(testRoute[pos+1:], r.CustomerIDs[pos:])
-
-				rDetails, feasible := calculateRouteDetails(testRoute, customers, depot, capacity)
-				if feasible {
-					cost := rDetails.Distance - r.Distance
-					if cost < bestInsertCost {
-						bestInsertCost = cost
-						bestRouteIdx = rIdx
-						bestPos = pos
-					}
-				}
-			}
-		}
+		bestRouteIdx, bestPos, _, _, feasible := findBestInsertion(sol.Routes, cID, customers, depot, capacity)
 
 		// Insert into existing route if found
-		if bestRouteIdx != -1 {
+		if feasible {
 			r := &sol.Routes[bestRouteIdx]
 			r.CustomerIDs = append(r.CustomerIDs, 0)
 			copy(r.CustomerIDs[bestPos+1:], r.CustomerIDs[bestPos:])

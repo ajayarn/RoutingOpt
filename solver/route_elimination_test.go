@@ -116,3 +116,46 @@ func TestDestroyRouteEliminationDoesNotAliasRetainedRoutesCustomerIDs(t *testing
 		t.Fatalf("destroyRouteElimination() aliased the retained route's CustomerIDs backing array: original.Routes[1].CustomerIDs[0] = %d, want 2 (unaffected by mutating partialSol)", original.Routes[1].CustomerIDs[0])
 	}
 }
+
+func TestRepairGreedyBehaviorUnchangedByRefactor(t *testing.T) {
+	customers := testCustomers()
+	depot := testDepot()
+	capacity := 10.0
+
+	// Case 1: the removed customer fits in an existing route - no new route
+	// should be opened.
+	sol := Solution{Routes: []Route{
+		buildRoute(t, []int{2}, 1, customers, depot, capacity), // demand 5, room for 5 more
+		buildRoute(t, []int{3}, 2, customers, depot, capacity), // demand 5, room for 5 more
+	}}
+	recalculateSolutionMetrics(&sol)
+
+	result := repairGreedy(sol, []int{1}, customers, depot, capacity)
+
+	if len(result.Routes) != 2 {
+		t.Fatalf("repairGreedy() opened a new route unexpectedly: got %d routes, want 2", len(result.Routes))
+	}
+	seen := map[int]bool{}
+	for _, r := range result.Routes {
+		for _, cID := range r.CustomerIDs {
+			seen[cID] = true
+		}
+	}
+	for _, want := range []int{1, 2, 3} {
+		if !seen[want] {
+			t.Fatalf("repairGreedy() result is missing customer %d: %+v", want, result.Routes)
+		}
+	}
+
+	// Case 2: nothing fits anywhere - repairGreedy must fall back to
+	// opening a new route (unlike repairGreedyNoNewRoute, it always
+	// succeeds).
+	sol2 := Solution{Routes: []Route{
+		buildRoute(t, []int{1}, 1, customers, depot, capacity), // demand 5, only 5 of room left
+	}}
+	recalculateSolutionMetrics(&sol2)
+	result2 := repairGreedy(sol2, []int{4}, customers, depot, capacity) // demand 9, can't fit
+	if len(result2.Routes) != 2 {
+		t.Fatalf("repairGreedy() did not open a new route when nothing fit: got %d routes, want 2", len(result2.Routes))
+	}
+}
