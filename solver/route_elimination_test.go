@@ -220,3 +220,53 @@ func TestRepairGreedyNoNewRouteFailsWithoutMutatingInput(t *testing.T) {
 		t.Fatalf("repairGreedyNoNewRoute() mutated its input: %+v", sol.Routes)
 	}
 }
+
+// TestRepairGreedyNoNewRouteDoesNotPartiallyCommitOnLaterFailure covers a
+// case TestRepairGreedyNoNewRouteFailsWithoutMutatingInput does not: more
+// than one customer in `removed`, where the first is feasible and gets
+// inserted before a later one turns out to have nowhere left to go. Because
+// `sol.Routes` is a slice, passing sol by value only copies the slice
+// header - `sol.Routes[i] = ...` still writes through to the same backing
+// array the caller's Solution literal owns, so a naive implementation can
+// commit the first customer's insertion into the caller's own routes
+// *before* discovering the second customer is infeasible and returning
+// ok=false. That violates "no partial commit" even though the single-write,
+// single-customer case (the test above) never triggers it.
+func TestRepairGreedyNoNewRouteDoesNotPartiallyCommitOnLaterFailure(t *testing.T) {
+	customers := map[int]Customer{
+		0: {ID: 0, X: 0, Y: 0, Demand: 0, ReadyTime: 0, DueDate: 1000, ServiceTime: 0},
+		1: {ID: 1, X: 1, Y: 0, Demand: 10, ReadyTime: 0, DueDate: 1000, ServiceTime: 0},
+		2: {ID: 2, X: 2, Y: 0, Demand: 6, ReadyTime: 0, DueDate: 1000, ServiceTime: 0},
+		3: {ID: 3, X: 3, Y: 0, Demand: 5, ReadyTime: 0, DueDate: 1000, ServiceTime: 0},
+	}
+	depot := testDepot()
+	capacity := 10.0
+
+	original := Solution{Routes: []Route{
+		buildRoute(t, []int{1}, 1, customers, depot, capacity), // demand 10, no room left
+		{VehicleID: 2, CustomerIDs: []int{}},                   // empty route, room for 10
+	}}
+	recalculateSolutionMetrics(&original)
+
+	// Customer 2 (demand 6) and customer 3 (demand 5) both individually fit
+	// in the empty route2 (room 10), but not together (6+5=11 > 10) - and
+	// route1 has no room for either. So whichever is inserted first
+	// "succeeds" locally, but the attempt as a whole must still fail once
+	// the second customer is found to have nowhere left to go.
+	result, ok := repairGreedyNoNewRoute(original, []int{2, 3}, customers, depot, capacity)
+	if ok {
+		t.Fatalf("repairGreedyNoNewRoute() returned ok=true, want false (customers 2 and 3 together can't fit in the only open room)")
+	}
+
+	// The returned Solution must not be a partially-repaired one: route2
+	// must still be empty, not holding whichever of {2,3} got inserted
+	// before the failure was discovered.
+	if len(result.Routes) != 2 || len(result.Routes[1].CustomerIDs) != 0 {
+		t.Fatalf("repairGreedyNoNewRoute() returned a partially-committed solution on failure: %+v", result.Routes)
+	}
+
+	// The original argument must also be untouched.
+	if len(original.Routes) != 2 || len(original.Routes[1].CustomerIDs) != 0 {
+		t.Fatalf("repairGreedyNoNewRoute() mutated its input on failure: %+v", original.Routes)
+	}
+}

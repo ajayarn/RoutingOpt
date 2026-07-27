@@ -1093,8 +1093,8 @@ func repairGreedy(sol Solution, removed []int, customers map[int]Customer, depot
 
 // repairGreedyNoNewRoute attempts to reinsert every customer in `removed`
 // into sol's existing routes only - it may never open a new route. Returns
-// ok=false (sol returned unchanged, no partial commit) if any customer
-// cannot be placed feasibly.
+// ok=false (sol - the original, unmodified argument - returned, no partial
+// commit) if any customer cannot be placed feasibly.
 //
 // Insertion order is most-constrained-first, recomputed dynamically before
 // each insertion: whichever not-yet-placed customer currently has the
@@ -1103,7 +1103,23 @@ func repairGreedy(sol Solution, removed []int, customers map[int]Customer, depot
 // consume the capacity/time slack a "hard" customer needed - exactly why
 // repairGreedy's random insertion order almost never manages a full-route
 // reinsertion.
+//
+// All work happens on a `working` clone, never on `sol.Routes` directly.
+// sol is passed by value, but Solution.Routes is a slice - a struct copy
+// only copies the slice header, not its backing array, so writing through
+// sol.Routes[i] would still mutate the same backing array the caller's own
+// Solution owns. That matters across more than one successful insertion in
+// the same call: if customer A is placed into an existing route and only
+// later does customer B turn out to have nowhere feasible left, returning
+// early must not have already committed A's insertion into anything the
+// caller can still see - not the input, and not a partially-repaired
+// return value either. Operating on `working` throughout, and only
+// returning it once every customer in `removed` has been placed, gives
+// both guarantees at once (see
+// TestRepairGreedyNoNewRouteDoesNotPartiallyCommitOnLaterFailure).
 func repairGreedyNoNewRoute(sol Solution, removed []int, customers map[int]Customer, depot Customer, capacity float64) (Solution, bool) {
+	working := cloneSolution(sol)
+
 	remaining := make(map[int]bool, len(removed))
 	for _, cID := range removed {
 		remaining[cID] = true
@@ -1116,17 +1132,15 @@ func repairGreedyNoNewRoute(sol Solution, removed []int, customers map[int]Custo
 		bestSlotCount := -1
 
 		for cID := range remaining {
-			routeIdx, pos, _, slotCount, feasible := findBestInsertion(sol.Routes, cID, customers, depot, capacity)
+			routeIdx, pos, _, slotCount, feasible := findBestInsertion(working.Routes, cID, customers, depot, capacity)
 			if !feasible {
 				// This customer has nowhere feasible to go in the existing
-				// routes - the whole elimination attempt fails. Any
-				// customers already placed earlier in this call were
-				// written into fresh, freshly-allocated CustomerIDs slices
-				// (see findBestInsertion/calculateRouteDetails), never
-				// back into sol's original backing arrays, so returning
-				// sol here (unmodified from the caller's perspective) is
-				// safe - see Task 6 test
-				// TestRepairGreedyNoNewRouteFailsWithoutMutatingInput.
+				// routes - the whole elimination attempt fails. Every
+				// insertion made so far in this call went into `working`,
+				// never into `sol`, so `sol` (the caller's original,
+				// returned here unchanged) was never written through - see
+				// TestRepairGreedyNoNewRouteFailsWithoutMutatingInput and
+				// TestRepairGreedyNoNewRouteDoesNotPartiallyCommitOnLaterFailure.
 				return sol, false
 			}
 
@@ -1138,7 +1152,7 @@ func repairGreedyNoNewRoute(sol Solution, removed []int, customers map[int]Custo
 			}
 		}
 
-		r := &sol.Routes[bestRouteIdx]
+		r := &working.Routes[bestRouteIdx]
 		newIDs := make([]int, len(r.CustomerIDs)+1)
 		copy(newIDs[:bestPos], r.CustomerIDs[:bestPos])
 		newIDs[bestPos] = bestCustID
@@ -1146,16 +1160,16 @@ func repairGreedyNoNewRoute(sol Solution, removed []int, customers map[int]Custo
 
 		rDetails, _ := calculateRouteDetails(newIDs, customers, depot, capacity)
 		rDetails.VehicleID = r.VehicleID
-		sol.Routes[bestRouteIdx] = rDetails
+		working.Routes[bestRouteIdx] = rDetails
 
 		delete(remaining, bestCustID)
 	}
 
-	for idx := range sol.Routes {
-		sol.Routes[idx].VehicleID = idx + 1
+	for idx := range working.Routes {
+		working.Routes[idx].VehicleID = idx + 1
 	}
-	recalculateSolutionMetrics(&sol)
-	return sol, true
+	recalculateSolutionMetrics(&working)
+	return working, true
 }
 
 func cloneSolution(sol Solution) Solution {
