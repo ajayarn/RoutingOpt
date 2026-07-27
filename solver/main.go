@@ -62,6 +62,21 @@ func shouldTriggerStagnationSolver(stagnationCounter, llmThreshold, totalIterati
 	return llmThreshold > 0 && stagnationCounter >= llmThreshold && totalIterations >= llmThreshold
 }
 
+// chooseDestroyOperator maps a uniform random roll in [0, 1) to a destroy
+// operator name using the 20% Route Elimination / 40% Worst / 40% Random
+// split. Extracted as a pure function so the split itself is unit-testable
+// without running a full solve.
+func chooseDestroyOperator(roll float64) string {
+	switch {
+	case roll < 0.20:
+		return "Route Elimination"
+	case roll < 0.60:
+		return "Worst Destroy"
+	default:
+		return "Random Destroy"
+	}
+}
+
 func main() {
 	filePath := flag.String("file", "", "Path to the Solomon instance file")
 	iterations := flag.Int("iterations", 1000, "Number of LNS iterations")
@@ -123,20 +138,29 @@ func main() {
 		// Decide how many customers to destroy
 		k := rand.Intn(maxDestroy-minDestroy+1) + minDestroy
 
-		// 1. Destroy
-		var removed []int
-		var partialSol Solution
-		destroyType := "Worst Destroy"
-		if rand.Float64() < 0.5 {
-			partialSol, removed = destroyWorst(currentSol, k, customerMap, depot)
-		} else {
-			destroyType = "Random Destroy"
-			partialSol, removed = destroyRandom(currentSol, k, customerMap, depot)
-		}
-		sendProgressLog(iter, bestSol, startTime, "LNS:CHOOSE", "Neighborhood '%s' selected to remove %d customers: %v", destroyType, k, removed)
+		// 1. Destroy + 2. Repair
+		destroyType := chooseDestroyOperator(rand.Float64())
+		var candidateSol Solution
 
-		// 2. Repair
-		candidateSol := repairGreedy(partialSol, removed, customerMap, depot, capacity)
+		if destroyType == "Route Elimination" {
+			eliminated, ok := tryRouteElimination(currentSol, customerMap, depot, capacity, 3)
+			sendProgressLog(iter, bestSol, startTime, "LNS:CHOOSE", "Neighborhood '%s' attempted (success=%v)", destroyType, ok)
+			if ok {
+				candidateSol = eliminated
+			} else {
+				candidateSol = currentSol
+			}
+		} else {
+			var removed []int
+			var partialSol Solution
+			if destroyType == "Worst Destroy" {
+				partialSol, removed = destroyWorst(currentSol, k, customerMap, depot)
+			} else {
+				partialSol, removed = destroyRandom(currentSol, k, customerMap, depot)
+			}
+			sendProgressLog(iter, bestSol, startTime, "LNS:CHOOSE", "Neighborhood '%s' selected to remove %d customers: %v", destroyType, k, removed)
+			candidateSol = repairGreedy(partialSol, removed, customerMap, depot, capacity)
+		}
 
 		// 3. Evaluate & Decide (Acceptance criterion)
 		accept := false

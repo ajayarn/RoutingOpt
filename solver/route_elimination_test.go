@@ -354,3 +354,22 @@ func TestTryRouteEliminationFailsWhenTimeWindowsPreventMerging(t *testing.T) {
 		t.Fatalf("tryRouteElimination() mutated its input on failure: %+v", sol.Routes)
 	}
 }
+
+func TestChooseDestroyOperatorSplit(t *testing.T) {
+	cases := []struct {
+		roll float64
+		want string
+	}{
+		{0.0, "Route Elimination"},
+		{0.19, "Route Elimination"},
+		{0.20, "Worst Destroy"},
+		{0.59, "Worst Destroy"},
+		{0.60, "Random Destroy"},
+		{0.999, "Random Destroy"},
+	}
+	for _, c := range cases {
+		if got := chooseDestroyOperator(c.roll); got != c.want {
+			t.Errorf("chooseDestroyOperator(%.3f) = %q, want %q", c.roll, got, c.want)
+		}
+	}
+}
