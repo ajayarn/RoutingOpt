@@ -118,6 +118,13 @@ func main() {
 		return
 	}
 
+	// 2b. Vehicle-minimization pre-phase: while the solution is still loose
+	// (freshly constructed, not yet distance-optimized), aggressively try
+	// to eliminate routes before the main distance-focused loop starts. See
+	// docs/superpowers/specs/2026-07-27-route-elimination-operator-design.md.
+	prePhaseBudget := int(0.10 * float64(*iterations))
+	sol = runVehicleMinimizationPrePhase(sol, customerMap, depot, capacity, prePhaseBudget, startTime)
+
 	// Send initial progress
 	sendProgress(0, sol, startTime)
 
@@ -1221,6 +1228,38 @@ func tryRouteElimination(sol Solution, customers map[int]Customer, depot Custome
 	}
 
 	return sol, false
+}
+
+// runVehicleMinimizationPrePhase attempts to reduce vehicle count as far as
+// possible while the solution is still loose (freshly constructed, not yet
+// distance-optimized) - see
+// docs/superpowers/specs/2026-07-27-route-elimination-operator-design.md
+// for why this runs up front rather than only reactively. Stops as soon as
+// any of the following happens: a route-elimination attempt fails
+// (deterministic given the same solution, so retrying immediately can't
+// succeed), the capacity lower bound is reached, or budget attempts are
+// used up.
+func runVehicleMinimizationPrePhase(sol Solution, customers map[int]Customer, depot Customer, capacity float64, budget int, startTime time.Time) Solution {
+	lowerBound := minVehiclesLowerBound(customers, capacity)
+
+	for attempt := 1; attempt <= budget; attempt++ {
+		if sol.TotalVehicles <= lowerBound {
+			sendProgressLog(0, sol, startTime, "VEHICLE-MIN", "Reached capacity lower bound (%d vehicles) after %d attempt(s) - stopping pre-phase", lowerBound, attempt-1)
+			return sol
+		}
+
+		newSol, ok := tryRouteElimination(sol, customers, depot, capacity, 3)
+		if !ok {
+			sendProgressLog(0, sol, startTime, "VEHICLE-MIN", "No further route elimination possible after %d attempt(s); stalled at %d vehicles (capacity floor %d)", attempt, sol.TotalVehicles, lowerBound)
+			return sol
+		}
+
+		sol = newSol
+		sendProgressLog(0, sol, startTime, "VEHICLE-MIN", "Eliminated a route on attempt %d - now %d vehicles, %.2f distance", attempt, sol.TotalVehicles, sol.TotalDistance)
+	}
+
+	sendProgressLog(0, sol, startTime, "VEHICLE-MIN", "Pre-phase budget (%d attempts) exhausted at %d vehicles (capacity floor %d)", budget, sol.TotalVehicles, lowerBound)
+	return sol
 }
 
 func cloneSolution(sol Solution) Solution {

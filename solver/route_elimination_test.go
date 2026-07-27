@@ -1,6 +1,9 @@
 package main
 
-import "testing"
+import (
+	"testing"
+	"time"
+)
 
 func testCustomers() map[int]Customer {
 	return map[int]Customer{
@@ -352,6 +355,46 @@ func TestTryRouteEliminationFailsWhenTimeWindowsPreventMerging(t *testing.T) {
 	}
 	if len(sol.Routes) != 2 || len(sol.Routes[0].CustomerIDs) != 1 || len(sol.Routes[1].CustomerIDs) != 1 {
 		t.Fatalf("tryRouteElimination() mutated its input on failure: %+v", sol.Routes)
+	}
+}
+
+func TestVehicleMinimizationPrePhaseStopsAtLowerBound(t *testing.T) {
+	customers := testCustomers() // demand 5,5,5,9 -> lower bound 3 @ capacity 10
+	depot := testDepot()
+	capacity := 10.0
+
+	sol := Solution{Routes: []Route{
+		buildRoute(t, []int{1}, 1, customers, depot, capacity),
+		buildRoute(t, []int{2}, 2, customers, depot, capacity),
+		buildRoute(t, []int{3}, 3, customers, depot, capacity),
+		buildRoute(t, []int{4}, 4, customers, depot, capacity),
+	}}
+	recalculateSolutionMetrics(&sol)
+
+	result := runVehicleMinimizationPrePhase(sol, customers, depot, capacity, 50, time.Now())
+
+	if result.TotalVehicles != 3 {
+		t.Fatalf("runVehicleMinimizationPrePhase() left %d vehicles, want 3 (the capacity lower bound)", result.TotalVehicles)
+	}
+}
+
+func TestVehicleMinimizationPrePhaseRespectsZeroBudget(t *testing.T) {
+	customers := testCustomers()
+	depot := testDepot()
+	capacity := 10.0
+
+	sol := Solution{Routes: []Route{
+		buildRoute(t, []int{1}, 1, customers, depot, capacity),
+		buildRoute(t, []int{2}, 2, customers, depot, capacity),
+		buildRoute(t, []int{3}, 3, customers, depot, capacity),
+		buildRoute(t, []int{4}, 4, customers, depot, capacity),
+	}}
+	recalculateSolutionMetrics(&sol)
+
+	// A budget of 0 must be a complete no-op.
+	result := runVehicleMinimizationPrePhase(sol, customers, depot, capacity, 0, time.Now())
+	if result.TotalVehicles != 4 {
+		t.Fatalf("runVehicleMinimizationPrePhase() with budget=0 changed vehicle count: got %d, want 4 (unchanged)", result.TotalVehicles)
 	}
 }
 
