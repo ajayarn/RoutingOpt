@@ -316,6 +316,33 @@ func TestDestroyRouteEliminationRemovesWholeRouteOnly(t *testing.T) {
 		t.Fatalf("destroyRouteElimination() mutated its input: %+v", original.Routes)
 	}
 }
+
+func TestDestroyRouteEliminationDoesNotAliasRetainedRoutesCustomerIDs(t *testing.T) {
+	customers := testCustomers()
+	depot := testDepot()
+	capacity := 10.0
+
+	original := Solution{Routes: []Route{
+		buildRoute(t, []int{1}, 1, customers, depot, capacity),
+		buildRoute(t, []int{2}, 2, customers, depot, capacity),
+	}}
+
+	partialSol, _ := destroyRouteElimination(original, 0)
+
+	// Mutate the retained route's CustomerIDs slice element directly. If
+	// destroyRouteElimination aliased the original's backing array instead
+	// of deep-copying it (via cloneSolution), this write would be visible
+	// through `original` too - this is the property repairGreedy's
+	// in-place append-based insertion (solver/main.go) would otherwise
+	// silently violate on any route whose CustomerIDs slice has spare
+	// capacity (the normal case for routes built via repeated
+	// single-element appends elsewhere in this file).
+	partialSol.Routes[0].CustomerIDs[0] = 999
+
+	if original.Routes[1].CustomerIDs[0] != 2 {
+		t.Fatalf("destroyRouteElimination() aliased the retained route's CustomerIDs backing array: original.Routes[1].CustomerIDs[0] = %d, want 2 (unaffected by mutating partialSol)", original.Routes[1].CustomerIDs[0])
+	}
+}
 ```
 
 - [ ] **Step 2: Run test to verify it fails**
@@ -331,12 +358,28 @@ Expected: FAIL with `undefined: destroyRouteElimination`
 // that was evicted. Same (Solution, []int) shape as
 // destroyWorst/destroyRandom, but always empties one whole route rather
 // than a random k customers scattered across many routes.
+//
+// Builds the retained routes from cloneSolution(sol) rather than copying
+// sol.Routes directly: a plain range-copy only copies each Route struct by
+// value, but CustomerIDs (and the time maps) are reference types, so the
+// copy would still alias sol's original backing arrays. Since routes are
+// built incrementally via single-element appends elsewhere in this file,
+// their CustomerIDs slices routinely end up with spare capacity (Go's
+// append growth strategy over-allocates) - a later in-place append onto an
+// aliased slice (as repairGreedy's insertion does) can silently corrupt
+// sol's original data even though sol itself is never directly assigned
+// to. cloneSolution already deep-copies every route's CustomerIDs and time
+// maps, so starting from it guarantees the caller's sol stays pristine
+// across repeated destroy/repair attempts against it (see tryRouteElimination,
+// Task 7, which relies on exactly this to retry against the same original
+// sol when one attempt fails).
 func destroyRouteElimination(sol Solution, routeIdx int) (Solution, []int) {
 	removed := make([]int, len(sol.Routes[routeIdx].CustomerIDs))
 	copy(removed, sol.Routes[routeIdx].CustomerIDs)
 
-	newRoutes := make([]Route, 0, len(sol.Routes)-1)
-	for i, r := range sol.Routes {
+	cloned := cloneSolution(sol)
+	newRoutes := make([]Route, 0, len(cloned.Routes)-1)
+	for i, r := range cloned.Routes {
 		if i != routeIdx {
 			newRoutes = append(newRoutes, r)
 		}
