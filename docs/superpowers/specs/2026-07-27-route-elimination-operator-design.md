@@ -107,8 +107,13 @@ func repairGreedyNoNewRoute(sol Solution, removed []int, customers map[int]Custo
 
 Implementation notes:
 - Reuses the same best-feasible-insertion-position search as `repairGreedy`
-  (test every `(route, pos)`, keep the cheapest feasible one) — just without
-  the "else open a new route" fallback.
+  via a shared `findBestInsertion` helper extracted from `repairGreedy`
+  during implementation (test every `(route, pos)`, keep the cheapest
+  feasible one) — just without the "else open a new route" fallback. This
+  is a deliberate, narrow exception to leaving existing code untouched: it
+  removes duplication between the two repair functions at the cost of a
+  small, behavior-preserving refactor of `repairGreedy` (locked in by a
+  characterization test before the refactor lands).
 - If a customer that had ≥1 feasible slot when the ranking was computed ends
   up with 0 by the time its turn comes (because earlier insertions consumed
   the slack), abort the whole attempt with `ok=false` rather than opening a

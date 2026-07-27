@@ -4,7 +4,7 @@
 
 **Goal:** Give the Go LNS solver (`solver/main.go`) a genuine, constructed way to reduce vehicle count, instead of relying on the current destroy/repair operators to stumble into it by luck — fixing the observed "lower distance but one extra vehicle vs. best-known" symptom.
 
-**Architecture:** Add a hard-feasibility-only route-elimination destroy/repair pair (`destroyRouteElimination` + `repairGreedyNoNewRoute`), orchestrated by `tryRouteElimination` with a capacity-based lower-bound short-circuit (`minVehiclesLowerBound`). Fire it two ways: a bounded pre-phase right after construction while the solution is still loose (`runVehicleMinimizationPrePhase`, budget = 10% of `-iterations`), and a 20% opportunistic branch in the main loop's destroy-type choice (`chooseDestroyOperator`, replacing the existing 50/50 split).
+**Architecture:** Add a hard-feasibility-only route-elimination destroy/repair pair (`destroyRouteElimination` + `repairGreedyNoNewRoute`), orchestrated by `tryRouteElimination` with a capacity-based lower-bound short-circuit (`minVehiclesLowerBound`). Both the new repair and the existing `repairGreedy` share a single insertion-search helper (`findBestInsertion`) rather than duplicating that logic. Fire the new operator two ways: a bounded pre-phase right after construction while the solution is still loose (`runVehicleMinimizationPrePhase`, budget = 10% of `-iterations`), and a 20% opportunistic branch in the main loop's destroy-type choice (`chooseDestroyOperator`, replacing the existing 50/50 split).
 
 **Tech Stack:** Go 1.24 (`solver/main.go`, package `main`, module `routingopt-solver`), Go's standard `testing` package.
 
@@ -16,6 +16,7 @@
 - Run tests from the `solver/` directory: `cd solver && go test ./...`.
 - Do not touch `invokeLKHSubSolver`, `-use-lkh`, or any LKH3 code path — this feature is scoped to the default (non-LKH) main loop only.
 - Do not add a CLI flag for the 20/40/40 split, `maxAttempts`, or the pre-phase budget — these are hardcoded per the spec's YAGNI section.
+- `repairGreedy` (existing) IS in scope for a narrow, behavior-preserving refactor in Task 5 — extracting its insertion-search loop into a shared `findBestInsertion` helper so the new `repairGreedyNoNewRoute` doesn't duplicate that logic. This was a deliberate decision (DRY over isolation) made explicitly for this plan — see Task 5's characterization test, which locks in `repairGreedy`'s exact current behavior before the refactor touches it.
 - Commit after every task.
 
 ---
@@ -28,7 +29,7 @@
 
 **Interfaces:**
 - Consumes: the committed `solver_bin` binary and `public/data/*.txt` instance files, as they exist on `main` before this branch's changes.
-- Produces: `/tmp/route-elim-baseline/summary.txt`, read by Task 10 for the before/after comparison.
+- Produces: `/tmp/route-elim-baseline/summary.txt`, read by Task 11 for the before/after comparison.
 
 - [ ] **Step 1: Rebuild `solver_bin` from the current (unmodified) source, to guarantee the baseline reflects exactly the code about to be changed**
 
@@ -75,7 +76,7 @@ EOF
 python3 /tmp/route-elim-baseline/summarize.py | tee /tmp/route-elim-baseline/summary.txt
 ```
 
-Expected: a line per instance; note which ones are flagged `<-- EXTRA VEHICLE` — those are the ones Task 10 will re-check after the fix. (`c101` at only 20 iterations was already observed to produce 11 vehicles vs. the 10 best-known during design research, so at least `c101` is likely to show up here.)
+Expected: a line per instance; note which ones are flagged `<-- EXTRA VEHICLE` — those are the ones Task 11 will re-check after the fix. (`c101` at only 20 iterations was already observed to produce 11 vehicles vs. the 10 best-known during design research, so at least `c101` is likely to show up here.)
 
 - [ ] **Step 4: No commit for this task** (nothing under version control changed) — proceed directly to Task 2.
 
@@ -361,14 +362,181 @@ git commit -m "Add destroyRouteElimination: empty one whole route, not a random 
 
 ---
 
-### Task 5: `repairGreedyNoNewRoute`
+### Task 5: Extract `findBestInsertion` helper, refactor `repairGreedy` to use it
+
+**Files:**
+- Modify: `solver/main.go` (add `findBestInsertion` directly before `repairGreedy`, ~line 926; modify the body of `repairGreedy`, ~line 926-985, leaving its signature and behavior unchanged)
+- Test: `solver/route_elimination_test.go`
+
+**Interfaces:**
+- Produces: `func findBestInsertion(routes []Route, cID int, customers map[int]Customer, depot Customer, capacity float64) (routeIdx int, pos int, cost float64, slotCount int, feasible bool)` — searches every `(route, position)` pair for the cheapest feasible insertion of `cID`, and also counts how many positions are feasible in total (`slotCount`). This is used directly by Task 6's `repairGreedyNoNewRoute`.
+- `repairGreedy`'s public signature and observable behavior are unchanged — this is a pure internal refactor.
+
+This task is a narrow, deliberate exception to "don't touch existing code" (see this plan's Global Constraints): it removes duplication between `repairGreedy` and the new `repairGreedyNoNewRoute` (Task 6) by extracting their shared insertion-search loop. Because it touches the live default code path, **write a characterization test first** that locks in `repairGreedy`'s current behavior, confirm it passes against the *unmodified* function, and only then refactor — re-running the same test afterward is what proves the refactor didn't change behavior.
+
+- [ ] **Step 1: Write a characterization test for `repairGreedy`'s current behavior**
+
+```go
+func TestRepairGreedyBehaviorUnchangedByRefactor(t *testing.T) {
+	customers := testCustomers()
+	depot := testDepot()
+	capacity := 10.0
+
+	// Case 1: the removed customer fits in an existing route - no new route
+	// should be opened.
+	sol := Solution{Routes: []Route{
+		buildRoute(t, []int{2}, 1, customers, depot, capacity), // demand 5, room for 5 more
+		buildRoute(t, []int{3}, 2, customers, depot, capacity), // demand 5, room for 5 more
+	}}
+	recalculateSolutionMetrics(&sol)
+
+	result := repairGreedy(sol, []int{1}, customers, depot, capacity)
+
+	if len(result.Routes) != 2 {
+		t.Fatalf("repairGreedy() opened a new route unexpectedly: got %d routes, want 2", len(result.Routes))
+	}
+	seen := map[int]bool{}
+	for _, r := range result.Routes {
+		for _, cID := range r.CustomerIDs {
+			seen[cID] = true
+		}
+	}
+	for _, want := range []int{1, 2, 3} {
+		if !seen[want] {
+			t.Fatalf("repairGreedy() result is missing customer %d: %+v", want, result.Routes)
+		}
+	}
+
+	// Case 2: nothing fits anywhere - repairGreedy must fall back to
+	// opening a new route (unlike repairGreedyNoNewRoute, it always
+	// succeeds).
+	sol2 := Solution{Routes: []Route{
+		buildRoute(t, []int{1}, 1, customers, depot, capacity), // demand 5, only 5 of room left
+	}}
+	recalculateSolutionMetrics(&sol2)
+	result2 := repairGreedy(sol2, []int{4}, customers, depot, capacity) // demand 9, can't fit
+	if len(result2.Routes) != 2 {
+		t.Fatalf("repairGreedy() did not open a new route when nothing fit: got %d routes, want 2", len(result2.Routes))
+	}
+}
+```
+
+- [ ] **Step 2: Run the test against the current, unmodified `repairGreedy` to confirm it already passes**
+
+Run: `cd solver && go test ./... -run TestRepairGreedyBehaviorUnchangedByRefactor -v`
+Expected: PASS (this is a characterization test, not a red-first TDD test — `repairGreedy` already exists and already behaves this way; this step proves the test itself is correct before you rely on it to catch regressions in Step 4)
+
+- [ ] **Step 3: Add `findBestInsertion` and refactor `repairGreedy` to use it**
+
+Add this function to `solver/main.go` directly before `repairGreedy` (currently ~line 926):
+
+```go
+// findBestInsertion searches every (route, position) pair across routes for
+// the cheapest feasible place to insert customer cID, and also counts how
+// many positions are feasible in total (slotCount) - used by
+// repairGreedyNoNewRoute's most-constrained-first ordering. Shared by
+// repairGreedy and repairGreedyNoNewRoute so this insertion-cost search
+// exists in exactly one place.
+func findBestInsertion(routes []Route, cID int, customers map[int]Customer, depot Customer, capacity float64) (routeIdx int, pos int, cost float64, slotCount int, feasible bool) {
+	routeIdx = -1
+	pos = -1
+	cost = 1e9
+
+	for rIdx, r := range routes {
+		for p := 0; p <= len(r.CustomerIDs); p++ {
+			testRoute := make([]int, len(r.CustomerIDs)+1)
+			copy(testRoute[:p], r.CustomerIDs[:p])
+			testRoute[p] = cID
+			copy(testRoute[p+1:], r.CustomerIDs[p:])
+
+			rDetails, ok := calculateRouteDetails(testRoute, customers, depot, capacity)
+			if ok {
+				slotCount++
+				c := rDetails.Distance - r.Distance
+				if c < cost {
+					cost = c
+					routeIdx = rIdx
+					pos = p
+					feasible = true
+				}
+			}
+		}
+	}
+
+	return routeIdx, pos, cost, slotCount, feasible
+}
+```
+
+Then, in `solver/main.go`, find this exact block inside `repairGreedy`:
+
+```go
+	for _, cID := range removed {
+		bestRouteIdx := -1
+		bestPos := -1
+		bestInsertCost := 1e9
+
+		for rIdx, r := range sol.Routes {
+			for pos := 0; pos <= len(r.CustomerIDs); pos++ {
+				testRoute := make([]int, len(r.CustomerIDs)+1)
+				copy(testRoute[:pos], r.CustomerIDs[:pos])
+				testRoute[pos] = cID
+				copy(testRoute[pos+1:], r.CustomerIDs[pos:])
+
+				rDetails, feasible := calculateRouteDetails(testRoute, customers, depot, capacity)
+				if feasible {
+					cost := rDetails.Distance - r.Distance
+					if cost < bestInsertCost {
+						bestInsertCost = cost
+						bestRouteIdx = rIdx
+						bestPos = pos
+					}
+				}
+			}
+		}
+
+		// Insert into existing route if found
+		if bestRouteIdx != -1 {
+```
+
+Replace it with:
+
+```go
+	for _, cID := range removed {
+		bestRouteIdx, bestPos, _, _, feasible := findBestInsertion(sol.Routes, cID, customers, depot, capacity)
+
+		// Insert into existing route if found
+		if feasible {
+```
+
+(Everything after this point in `repairGreedy` — the insertion itself, the `else` branch that opens a new route, and the loop's closing brace — is unchanged. `feasible` now serves exactly the role `bestRouteIdx != -1` used to: `findBestInsertion` only sets `feasible = true` when it found at least one improving, feasible assignment, matching the old loop's `bestInsertCost < 1e9` condition exactly.)
+
+- [ ] **Step 4: Run the characterization test again to confirm behavior is unchanged**
+
+Run: `cd solver && go test ./... -run TestRepairGreedyBehaviorUnchangedByRefactor -v`
+Expected: PASS (still — proves the refactor preserved `repairGreedy`'s behavior)
+
+- [ ] **Step 5: Run the full test suite**
+
+Run: `cd solver && go test ./... -v`
+Expected: PASS (all tests)
+
+- [ ] **Step 6: Commit**
+
+```bash
+git add solver/main.go solver/route_elimination_test.go
+git commit -m "Extract findBestInsertion helper from repairGreedy, behavior-preserving"
+```
+
+---
+
+### Task 6: `repairGreedyNoNewRoute`
 
 **Files:**
 - Modify: `solver/main.go` (add directly after `repairGreedy`, ~line 985)
 - Test: `solver/route_elimination_test.go`
 
 **Interfaces:**
-- Consumes: `calculateRouteDetails` (existing, `solver/main.go:722`)
+- Consumes: `findBestInsertion` (Task 5)
 - Produces: `func repairGreedyNoNewRoute(sol Solution, removed []int, customers map[int]Customer, depot Customer, capacity float64) (Solution, bool)`
 
 - [ ] **Step 1: Write the failing tests (success and failure cases)**
@@ -441,7 +609,7 @@ func TestRepairGreedyNoNewRouteFailsWithoutMutatingInput(t *testing.T) {
 Run: `cd solver && go test ./... -run TestRepairGreedyNoNewRoute -v`
 Expected: FAIL with `undefined: repairGreedyNoNewRoute`
 
-- [ ] **Step 3: Implement `repairGreedyNoNewRoute` in `solver/main.go`, directly after `repairGreedy`**
+- [ ] **Step 3: Implement `repairGreedyNoNewRoute` in `solver/main.go`, directly after `repairGreedy`, using `findBestInsertion`**
 
 ```go
 // repairGreedyNoNewRoute attempts to reinsert every customer in `removed`
@@ -451,10 +619,11 @@ Expected: FAIL with `undefined: repairGreedyNoNewRoute`
 //
 // Insertion order is most-constrained-first, recomputed dynamically before
 // each insertion: whichever not-yet-placed customer currently has the
-// fewest feasible (route, position) slots goes next. This matters because
-// inserting "easy" customers first can consume the capacity/time slack a
-// "hard" customer needed - exactly why repairGreedy's random insertion
-// order almost never manages a full-route reinsertion.
+// fewest feasible (route, position) slots (findBestInsertion's slotCount)
+// goes next. This matters because inserting "easy" customers first can
+// consume the capacity/time slack a "hard" customer needed - exactly why
+// repairGreedy's random insertion order almost never manages a full-route
+// reinsertion.
 func repairGreedyNoNewRoute(sol Solution, removed []int, customers map[int]Customer, depot Customer, capacity float64) (Solution, bool) {
 	remaining := make(map[int]bool, len(removed))
 	for _, cID := range removed {
@@ -468,52 +637,25 @@ func repairGreedyNoNewRoute(sol Solution, removed []int, customers map[int]Custo
 		bestSlotCount := -1
 
 		for cID := range remaining {
-			slotCount := 0
-			custRouteIdx := -1
-			custPos := -1
-			custCost := 1e9
-
-			for rIdx, r := range sol.Routes {
-				for pos := 0; pos <= len(r.CustomerIDs); pos++ {
-					testRoute := make([]int, len(r.CustomerIDs)+1)
-					copy(testRoute[:pos], r.CustomerIDs[:pos])
-					testRoute[pos] = cID
-					copy(testRoute[pos+1:], r.CustomerIDs[pos:])
-
-					rDetails, feasible := calculateRouteDetails(testRoute, customers, depot, capacity)
-					if feasible {
-						slotCount++
-						cost := rDetails.Distance - r.Distance
-						if cost < custCost {
-							custCost = cost
-							custRouteIdx = rIdx
-							custPos = pos
-						}
-					}
-				}
-			}
-
-			if slotCount == 0 {
+			routeIdx, pos, _, slotCount, feasible := findBestInsertion(sol.Routes, cID, customers, depot, capacity)
+			if !feasible {
 				// This customer has nowhere feasible to go in the existing
-				// routes - the whole elimination attempt fails. sol is
-				// returned as received by the caller (see Task 5 test
-				// TestRepairGreedyNoNewRouteFailsWithoutMutatingInput): no
-				// insertion has been committed to sol.Routes yet on this
-				// path because every accepted insertion below replaces a
-				// route's CustomerIDs via append onto a fresh slice, which
-				// this codebase's routes always have exactly enough
-				// capacity to force a reallocation on (see calculateRouteDetails,
-				// which always builds CustomerIDs via a fresh slice) - so
-				// earlier accepted insertions in previous loop iterations
-				// never alias sol's original backing arrays either.
+				// routes - the whole elimination attempt fails. Any
+				// customers already placed earlier in this call were
+				// written into fresh, freshly-allocated CustomerIDs slices
+				// (see findBestInsertion/calculateRouteDetails), never
+				// back into sol's original backing arrays, so returning
+				// sol here (unmodified from the caller's perspective) is
+				// safe - see Task 6 test
+				// TestRepairGreedyNoNewRouteFailsWithoutMutatingInput.
 				return sol, false
 			}
 
 			if bestSlotCount == -1 || slotCount < bestSlotCount {
 				bestSlotCount = slotCount
 				bestCustID = cID
-				bestRouteIdx = custRouteIdx
-				bestPos = custPos
+				bestRouteIdx = routeIdx
+				bestPos = pos
 			}
 		}
 
@@ -552,14 +694,14 @@ git commit -m "Add repairGreedyNoNewRoute: most-constrained-first insertion, nev
 
 ---
 
-### Task 6: `tryRouteElimination`
+### Task 7: `tryRouteElimination`
 
 **Files:**
 - Modify: `solver/main.go` (add directly after `repairGreedyNoNewRoute`)
 - Test: `solver/route_elimination_test.go`
 
 **Interfaces:**
-- Consumes: `minVehiclesLowerBound`, `selectWeakestRoutes`, `destroyRouteElimination`, `repairGreedyNoNewRoute` (Tasks 2-5)
+- Consumes: `minVehiclesLowerBound` (Task 2), `selectWeakestRoutes` (Task 3), `destroyRouteElimination` (Task 4), `repairGreedyNoNewRoute` (Task 6)
 - Produces: `func tryRouteElimination(sol Solution, customers map[int]Customer, depot Customer, capacity float64, maxAttempts int) (Solution, bool)`
 
 - [ ] **Step 1: Write the failing tests**
@@ -700,14 +842,14 @@ git commit -m "Add tryRouteElimination: orchestrate weakest-route retries with l
 
 ---
 
-### Task 7: `chooseDestroyOperator` + wire the 3-way operator choice into the main loop
+### Task 8: `chooseDestroyOperator` + wire the 3-way operator choice into the main loop
 
 **Files:**
 - Modify: `solver/main.go` (add `chooseDestroyOperator` near `shouldTriggerStagnationSolver`, ~line 63; modify the main loop's destroy-type selection at ~line 126-139)
 - Test: `solver/route_elimination_test.go`
 
 **Interfaces:**
-- Consumes: `tryRouteElimination` (Task 6), `destroyWorst`, `destroyRandom`, `repairGreedy` (existing)
+- Consumes: `tryRouteElimination` (Task 7), `destroyWorst`, `destroyRandom`, `repairGreedy` (existing)
 - Produces: `func chooseDestroyOperator(roll float64) string` returning `"Route Elimination"`, `"Worst Destroy"`, or `"Random Destroy"`
 
 - [ ] **Step 1: Write the failing test**
@@ -835,14 +977,14 @@ git commit -m "Wire Route Elimination into the main loop as a 20% probabilistic 
 
 ---
 
-### Task 8: `runVehicleMinimizationPrePhase` + wire it into `main()` after construction
+### Task 9: `runVehicleMinimizationPrePhase` + wire it into `main()` after construction
 
 **Files:**
 - Modify: `solver/main.go` (add `runVehicleMinimizationPrePhase` directly after `tryRouteElimination`; modify `main()` right after `buildInitialSolution`, ~line 99-107)
 - Test: `solver/route_elimination_test.go`
 
 **Interfaces:**
-- Consumes: `minVehiclesLowerBound`, `tryRouteElimination` (Tasks 2, 6), `sendProgressLog` (existing)
+- Consumes: `minVehiclesLowerBound` (Task 2), `tryRouteElimination` (Task 7), `sendProgressLog` (existing)
 - Produces: `func runVehicleMinimizationPrePhase(sol Solution, customers map[int]Customer, depot Customer, capacity float64, budget int, startTime time.Time) Solution`
 
 - [ ] **Step 1: Write the failing tests**
@@ -1007,7 +1149,7 @@ git commit -m "Front-load vehicle-minimization as a 10%-of-iterations pre-phase 
 
 ---
 
-### Task 9: Full build and native-binary smoke test
+### Task 10: Full build and native-binary smoke test
 
 **Files:**
 - None modified — this task only builds and does a manual smoke run.
@@ -1045,7 +1187,7 @@ git commit -m "Rebuild solver_bin with the route-elimination operator"
 
 ---
 
-### Task 10: Compare against baseline, rebuild WASM artifacts, final commit
+### Task 11: Compare against baseline, rebuild WASM artifacts, final commit
 
 **Files:**
 - Modify: `public/wasm/solver.wasm`, `public/wasm/wasm_exec.js` (rebuilt binaries)
