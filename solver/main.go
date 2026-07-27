@@ -792,6 +792,28 @@ func recalculateSolutionMetrics(sol *Solution) {
 	}
 }
 
+// minVehiclesLowerBound is a closed-form LOWER bound on feasible vehicle
+// count from capacity alone (bin-packing bound) - cheap to compute, no
+// search required. Time windows can only push the true minimum UP from
+// this floor, never below it, so once a solution's vehicle count equals
+// this bound, further route-elimination attempts are provably pointless.
+func minVehiclesLowerBound(customers map[int]Customer, capacity float64) int {
+	if capacity <= 0 {
+		return 1
+	}
+
+	totalDemand := 0.0
+	for _, c := range customers {
+		totalDemand += c.Demand
+	}
+
+	bound := int(math.Ceil(totalDemand / capacity))
+	if bound < 1 {
+		bound = 1
+	}
+	return bound
+}
+
 // LNS Destroy: Remove worst-performing customers
 func destroyWorst(sol Solution, k int, customers map[int]Customer, depot Customer) (Solution, []int) {
 	type CostRecord struct {
