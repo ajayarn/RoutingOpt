@@ -61,3 +61,31 @@ func TestSelectWeakestRoutesRanksLowestDemandFirst(t *testing.T) {
 		t.Fatalf("selectWeakestRoutes() = %v, want the demand-9 route (index 3) ranked last", ranked)
 	}
 }
+
+func TestDestroyRouteEliminationRemovesWholeRouteOnly(t *testing.T) {
+	customers := testCustomers()
+	depot := testDepot()
+	capacity := 10.0
+
+	original := Solution{Routes: []Route{
+		buildRoute(t, []int{1}, 1, customers, depot, capacity),
+		buildRoute(t, []int{2, 3}, 2, customers, depot, capacity),
+	}}
+
+	result, removed := destroyRouteElimination(original, 0)
+
+	if len(result.Routes) != 1 {
+		t.Fatalf("destroyRouteElimination() left %d routes, want 1", len(result.Routes))
+	}
+	if got := result.Routes[0].CustomerIDs; len(got) != 2 || got[0] != 2 || got[1] != 3 {
+		t.Fatalf("destroyRouteElimination() left the wrong route intact: %v", got)
+	}
+	if len(removed) != 1 || removed[0] != 1 {
+		t.Fatalf("destroyRouteElimination() removed = %v, want [1]", removed)
+	}
+
+	// The original Solution passed in must be untouched.
+	if len(original.Routes) != 2 || len(original.Routes[0].CustomerIDs) != 1 || original.Routes[0].CustomerIDs[0] != 1 {
+		t.Fatalf("destroyRouteElimination() mutated its input: %+v", original.Routes)
+	}
+}

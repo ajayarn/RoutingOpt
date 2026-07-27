@@ -979,6 +979,27 @@ func destroyRandom(sol Solution, k int, customers map[int]Customer, depot Custom
 	return partialSol, removed
 }
 
+// destroyRouteElimination removes the entire route at routeIdx (not a
+// random subset) and returns the remaining solution plus every customer ID
+// that was evicted. Same (Solution, []int) shape as
+// destroyWorst/destroyRandom, but always empties one whole route rather
+// than a random k customers scattered across many routes.
+func destroyRouteElimination(sol Solution, routeIdx int) (Solution, []int) {
+	removed := make([]int, len(sol.Routes[routeIdx].CustomerIDs))
+	copy(removed, sol.Routes[routeIdx].CustomerIDs)
+
+	newRoutes := make([]Route, 0, len(sol.Routes)-1)
+	for i, r := range sol.Routes {
+		if i != routeIdx {
+			newRoutes = append(newRoutes, r)
+		}
+	}
+
+	partialSol := Solution{Routes: newRoutes}
+	recalculateSolutionMetrics(&partialSol)
+	return partialSol, removed
+}
+
 // LNS Repair: Greedy Insertion with Best Fit Time-Window Feasibility
 func repairGreedy(sol Solution, removed []int, customers map[int]Customer, depot Customer, capacity float64) Solution {
 	// Shuffle removed list to avoid order bias
