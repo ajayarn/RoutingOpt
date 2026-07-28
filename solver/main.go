@@ -319,9 +319,23 @@ func main() {
 						lkhHandled := false
 
 						if *useLKH {
-							sendProgressLog(iter, bestSol, startTime, "LKH:TRIGGER", "Attempt %d: Invoking LKH3 on %d removed customers (vehicles cap = %d, no timeout)...", attempt, len(destroyedCustomers), len(finalDestroyIDs))
 							lkhStart := time.Now()
-							lkhSol := invokeLKHSubSolver(destroyedCustomers, depot, capacity, customerMap, len(finalDestroyIDs))
+							var lkhSol *Solution
+
+							if probeVehicles, probeOK := shouldProbeLKHMinusOne(attempt, len(finalDestroyIDs)); probeOK {
+								sendProgressLog(iter, bestSol, startTime, "LKH:PROBE", "Attempt %d: probing whether %d vehicles suffice for %d removed customers (down from %d)...", attempt, probeVehicles, len(destroyedCustomers), len(finalDestroyIDs))
+								lkhSol = invokeLKHSubSolver(destroyedCustomers, depot, capacity, customerMap, probeVehicles)
+								if lkhSol != nil {
+									sendProgressLog(iter, bestSol, startTime, "LKH:PROBE-SUCCESS", "Probe succeeded: %d vehicles sufficient (reduced from %d) - skipping the %d-vehicle fallback.", probeVehicles, len(finalDestroyIDs), len(finalDestroyIDs))
+								} else {
+									sendProgressLog(iter, bestSol, startTime, "LKH:PROBE-FAILED", "Probe failed: %d vehicles not sufficient - falling back to %d.", probeVehicles, len(finalDestroyIDs))
+								}
+							}
+
+							if lkhSol == nil {
+								sendProgressLog(iter, bestSol, startTime, "LKH:TRIGGER", "Attempt %d: Invoking LKH3 on %d removed customers (vehicles cap = %d, no timeout)...", attempt, len(destroyedCustomers), len(finalDestroyIDs))
+								lkhSol = invokeLKHSubSolver(destroyedCustomers, depot, capacity, customerMap, len(finalDestroyIDs))
+							}
 							lkhElapsed := time.Since(lkhStart)
 
 							if lkhSol != nil {
@@ -1544,6 +1558,20 @@ func selectStagnationRoutesHeuristically(
 
 	// Fallback
 	return getClosestRoutes(rand.Intn(numRoutes), countToDestroy)
+}
+
+// shouldProbeLKHMinusOne reports whether the LKH3 minus-one vehicle probe
+// should fire for this stagnation attempt, and if so, the vehicle count to
+// probe. Probing only fires on the first attempt of a stagnation trigger -
+// this bounds the added LKH3 call cost to at most one extra solve per
+// trigger, not per attempt (attempts 2-3 keep today's unprobed behavior).
+// destroyedRouteCount <= 1 skips the probe entirely: asking LKH3 for 0
+// vehicles is meaningless.
+func shouldProbeLKHMinusOne(attempt int, destroyedRouteCount int) (probeVehicles int, ok bool) {
+	if attempt != 1 || destroyedRouteCount <= 1 {
+		return 0, false
+	}
+	return destroyedRouteCount - 1, true
 }
 
 // invokeLKHSubSolver re-solves a set of destroyed customers using the native LKH3

@@ -519,3 +519,31 @@ func TestChooseDestroyOperatorSplit(t *testing.T) {
 		}
 	}
 }
+
+func TestShouldProbeLKHMinusOne(t *testing.T) {
+	cases := []struct {
+		name                string
+		attempt             int
+		destroyedRouteCount int
+		wantProbeVehicles   int
+		wantOK              bool
+	}{
+		{"first attempt, multiple routes destroyed", 1, 3, 2, true},
+		{"first attempt, exactly two routes destroyed", 1, 2, 1, true},
+		{"first attempt, single route destroyed - probing 0 is meaningless", 1, 1, 0, false},
+		{"second attempt never probes", 2, 3, 0, false},
+		{"third attempt never probes", 3, 3, 0, false},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			gotProbeVehicles, gotOK := shouldProbeLKHMinusOne(tc.attempt, tc.destroyedRouteCount)
+			if gotOK != tc.wantOK {
+				t.Fatalf("shouldProbeLKHMinusOne(%d, %d) ok = %v, want %v", tc.attempt, tc.destroyedRouteCount, gotOK, tc.wantOK)
+			}
+			if gotOK && gotProbeVehicles != tc.wantProbeVehicles {
+				t.Fatalf("shouldProbeLKHMinusOne(%d, %d) probeVehicles = %d, want %d", tc.attempt, tc.destroyedRouteCount, gotProbeVehicles, tc.wantProbeVehicles)
+			}
+		})
+	}
+}
