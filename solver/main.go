@@ -83,7 +83,7 @@ func main() {
 	seed := flag.Int64("seed", 42, "Random seed")
 	llmThreshold := flag.Int("llm-threshold", 20, "Iteration threshold for LLM intervention")
 	useLLM := flag.Bool("use-llm", false, "Use Ollama LLM via /api/llm-destroy instead of the pure-Go heuristic for stagnation destroy selection")
-	useLKH := flag.Bool("use-lkh", false, "Use the native LKH3 binary instead of the pure-Go K-means+LNS sub-solver for stagnation sub-solving")
+	useLKH := flag.Bool("use-lkh", false, "Use the native LKH3 binary instead of the pure-Go I1+LNS sub-solver for stagnation sub-solving")
 	flag.Parse()
 
 	if *filePath == "" {
@@ -348,9 +348,9 @@ func main() {
 						}
 
 						if !lkhHandled {
-							sendProgressLog(iter, bestSol, startTime, "HEURISTIC:SUB-SOLVER", "Attempt %d: Re-routing %d removed customers. Phase 1: K-Means Clustering -> Initial Sequence Insertion...", attempt, len(destroyedCustomers))
+							sendProgressLog(iter, bestSol, startTime, "HEURISTIC:SUB-SOLVER", "Attempt %d: Re-routing %d removed customers. Phase 1: Solomon I1 Sequential Insertion...", attempt, len(destroyedCustomers))
 
-							// Re-solve with our approach: Clustering -> Initial solution -> LNS (run on the subset)
+							// Re-solve with our approach: I1 insertion -> LNS (run on the subset)
 							subSol = buildInitialSolution(destroyedCustomers, depot, capacity, customerMap)
 							sendProgressLog(iter, bestSol, startTime, "HEURISTIC:SUB-SOLVER", "Phase 1 Complete. Initial subproblem routing: %d vehicles, %.2f distance.", subSol.TotalVehicles, subSol.TotalDistance)
 
@@ -568,199 +568,179 @@ func parseSolomonFile(path string) (string, int, float64, Customer, []Customer, 
 	return name, vehicleNumber, capacity, depot, customers, nil
 }
 
-type Point struct {
-	X float64
-	Y float64
-}
+// Solomon I1 parameters (Solomon 1987). c1 = alpha1*c11 + alpha2*c12 is the
+// cost of inserting a customer between a specific (i,j) pair; c2 selects,
+// among all unrouted customers' best insertion points for the CURRENT
+// route, which one to actually insert. Fixed constants, not CLI flags,
+// consistent with this file's existing style for internal tuning knobs
+// (e.g. chooseDestroyOperator's 20/40/40 split).
+const (
+	i1Mu     = 1.0 // route-shape weight in c11 = d(i,u) + d(u,j) - mu*d(i,j)
+	i1Alpha1 = 0.5 // weight on the distance term c11 within c1
+	i1Alpha2 = 0.5 // weight on the time-shift term c12 within c1
+	i1Lambda = 2.0 // depot-distance regret weight in c2 = lambda*d(depot,u) - c1
+)
 
-// kMeansCluster partitions the customers into k clusters using the K-Means algorithm
-func kMeansCluster(customers []Customer, k int) [][]Customer {
-	if k <= 1 || len(customers) <= k {
-		// If k is 1 or fewer, or there are fewer customers than clusters, just return them
-		if k <= 1 || len(customers) == 0 {
-			return [][]Customer{customers}
-		}
-		clusters := make([][]Customer, len(customers))
-		for i, c := range customers {
-			clusters[i] = []Customer{c}
-		}
-		return clusters
-	}
-
-	// Initialize centroids by random selection
-	centroids := make([]Point, k)
-	usedIdx := make(map[int]bool)
-	for i := 0; i < k; i++ {
-		idx := rand.Intn(len(customers))
-		for usedIdx[idx] {
-			idx = rand.Intn(len(customers))
-		}
-		usedIdx[idx] = true
-		centroids[i] = Point{X: customers[idx].X, Y: customers[idx].Y}
-	}
-
-	maxIters := 50
-	clusters := make([][]Customer, k)
-
-	for iter := 0; iter < maxIters; iter++ {
-		// Reset clusters
-		clusters = make([][]Customer, k)
-
-		// Assign each customer to the nearest centroid
-		for _, cust := range customers {
-			minDist := math.MaxFloat64
-			bestCluster := 0
-			for i, cent := range centroids {
-				dist := math.Sqrt(math.Pow(cust.X-cent.X, 2) + math.Pow(cust.Y-cent.Y, 2))
-				if dist < minDist {
-					minDist = dist
-					bestCluster = i
-				}
-			}
-			clusters[bestCluster] = append(clusters[bestCluster], cust)
-		}
-
-		// Update centroids
-		changed := false
-		for i := 0; i < k; i++ {
-			if len(clusters[i]) == 0 {
-				// Empty cluster gets assigned to a random customer's coordinates
-				idx := rand.Intn(len(customers))
-				newCent := Point{X: customers[idx].X, Y: customers[idx].Y}
-				if centroids[i] != newCent {
-					centroids[i] = newCent
-					changed = true
-				}
-				continue
-			}
-
-			var sumX, sumY float64
-			for _, cust := range clusters[i] {
-				sumX += cust.X
-				sumY += cust.Y
-			}
-			newCent := Point{
-				X: sumX / float64(len(clusters[i])),
-				Y: sumY / float64(len(clusters[i])),
-			}
-
-			dist := math.Sqrt(math.Pow(centroids[i].X-newCent.X, 2) + math.Pow(centroids[i].Y-newCent.Y, 2))
-			if dist > 1e-4 {
-				centroids[i] = newCent
-				changed = true
-			}
-		}
-
-		if !changed {
-			break
-		}
-	}
-
-	// Return non-empty clusters
-	var result [][]Customer
-	for _, c := range clusters {
-		if len(c) > 0 {
-			result = append(result, c)
-		}
-	}
-	return result
-}
-
-// Solomon I1 Insertion Heuristic with initial Clustering step
+// buildInitialSolution constructs a feasible initial solution using
+// Solomon's I1 sequential insertion heuristic (Solomon, 1987): routes are
+// built one at a time from the full unrouted customer pool - each new
+// route is seeded with the unrouted customer farthest from the depot, then
+// filled by repeatedly selecting, among every unrouted customer's cheapest
+// feasible insertion point in the CURRENT route (c1, minimized), whichever
+// customer maximizes the depot-distance regret measure c2 - until no
+// unrouted customer fits feasibly anywhere in the route, at which point
+// the route closes and a new one begins. Does not cluster customers first:
+// c1's distance/time-window terms and c2's regret term already encode the
+// geographic and temporal locality clustering would otherwise approximate,
+// and a customer that doesn't fit the current route can be picked up by
+// ANY later route, not just one confined to a pre-assigned cluster.
 func buildInitialSolution(customers []Customer, depot Customer, capacity float64, customerMap map[int]Customer) Solution {
-	// 1. Calculate total demand and estimate number of clusters (K)
-	totalDemand := 0.0
+	unrouted := make(map[int]Customer, len(customers))
 	for _, c := range customers {
-		totalDemand += c.Demand
+		unrouted[c.ID] = c
 	}
-
-	// Est k with some capacity buffer (90%) so clusters map nicely to vehicles
-	k := int(math.Ceil(totalDemand / (capacity * 0.90)))
-	if k < 1 {
-		k = 1
-	}
-	if k > len(customers) {
-		k = len(customers)
-	}
-
-	// 2. Perform clustering
-	clusters := kMeansCluster(customers, k)
 
 	var routes []Route
 	vehicleID := 1
 
-	// 3. Route each cluster independently using I1 sequential insertion
-	for _, cluster := range clusters {
-		unrouted := make(map[int]Customer)
-		for _, c := range cluster {
-			unrouted[c.ID] = c
-		}
+	for len(unrouted) > 0 {
+		unroutedIDs := sortedIDs(unrouted)
 
-		for len(unrouted) > 0 {
-			// Initialize a new route with the most urgent seed customer of this cluster
-			var seedID int
-			bestScore := -1e9
+		seedID := selectSeedCustomer(unroutedIDs, unrouted, depot)
+		delete(unrouted, seedID)
+		routeCusts := []int{seedID}
 
-			for id, cust := range unrouted {
-				dist := distance(depot, cust)
-				score := dist*0.5 - cust.DueDate*0.5
-				if score > bestScore {
-					bestScore = score
-					seedID = id
-				}
+		for {
+			baseRoute, baseOK := calculateRouteDetails(routeCusts, customerMap, depot, capacity)
+			if !baseOK {
+				break // unreachable: routeCusts only grows via feasibility-checked insertion
 			}
 
-			delete(unrouted, seedID)
-			routeCusts := []int{seedID}
+			bestCustID := -1
+			bestPos := -1
+			bestC2 := -math.MaxFloat64
 
-			// Try to insert remaining customers of this cluster as long as feasible
-			for {
-				bestCustID := -1
-				bestPos := -1
-				bestInsertCost := 1e9
+			for _, id := range sortedIDs(unrouted) {
+				u := unrouted[id]
 
-				for id := range unrouted {
-					for pos := 0; pos <= len(routeCusts); pos++ {
-						// Test insertion
-						testRoute := make([]int, len(routeCusts)+1)
-						copy(testRoute[:pos], routeCusts[:pos])
-						testRoute[pos] = id
-						copy(testRoute[pos+1:], routeCusts[pos:])
+				custBestC1 := math.MaxFloat64
+				custBestPos := -1
 
-						rDetails, feasible := calculateRouteDetails(testRoute, customerMap, depot, capacity)
-						if feasible {
-							origDetails, _ := calculateRouteDetails(routeCusts, customerMap, depot, capacity)
-							cost := rDetails.Distance - origDetails.Distance
-							if cost < bestInsertCost {
-								bestInsertCost = cost
-								bestCustID = id
-								bestPos = pos
-							}
-						}
+				for pos := 0; pos <= len(routeCusts); pos++ {
+					candIDs := make([]int, len(routeCusts)+1)
+					copy(candIDs[:pos], routeCusts[:pos])
+					candIDs[pos] = id
+					copy(candIDs[pos+1:], routeCusts[pos:])
+
+					candRoute, feasible := calculateRouteDetails(candIDs, customerMap, depot, capacity)
+					if !feasible {
+						continue
+					}
+
+					c1 := i1c1(routeCusts, pos, u, customerMap, depot, baseRoute, candRoute)
+					if c1 < custBestC1 {
+						custBestC1 = c1
+						custBestPos = pos
 					}
 				}
 
-				if bestCustID != -1 {
-					routeCusts = append(routeCusts, 0)
-					copy(routeCusts[bestPos+1:], routeCusts[bestPos:])
-					routeCusts[bestPos] = bestCustID
-					delete(unrouted, bestCustID)
-				} else {
-					break
+				if custBestPos == -1 {
+					continue
+				}
+
+				c2 := i1Lambda*distance(depot, u) - custBestC1
+				if c2 > bestC2 || (c2 == bestC2 && id < bestCustID) {
+					bestC2 = c2
+					bestCustID = id
+					bestPos = custBestPos
 				}
 			}
 
-			// Complete and store the route
-			rDetails, _ := calculateRouteDetails(routeCusts, customerMap, depot, capacity)
-			rDetails.VehicleID = vehicleID
-			routes = append(routes, rDetails)
-			vehicleID++
+			if bestCustID == -1 {
+				break
+			}
+
+			routeCusts = append(routeCusts, 0)
+			copy(routeCusts[bestPos+1:], routeCusts[bestPos:])
+			routeCusts[bestPos] = bestCustID
+			delete(unrouted, bestCustID)
 		}
+
+		rDetails, _ := calculateRouteDetails(routeCusts, customerMap, depot, capacity)
+		rDetails.VehicleID = vehicleID
+		routes = append(routes, rDetails)
+		vehicleID++
 	}
 
 	sol := Solution{Routes: routes}
 	recalculateSolutionMetrics(&sol)
 	return sol
+}
+
+// sortedIDs returns a map's keys in ascending order, giving deterministic
+// iteration order and deterministic tie-breaks wherever this file would
+// otherwise range over a map directly.
+func sortedIDs(m map[int]Customer) []int {
+	ids := make([]int, 0, len(m))
+	for id := range m {
+		ids = append(ids, id)
+	}
+	sort.Ints(ids)
+	return ids
+}
+
+// selectSeedCustomer picks the unrouted customer farthest from the depot
+// (ties broken by lowest ID) to start a new route - the standard I1
+// convention, consistent with c2's own depot-distance regret term.
+func selectSeedCustomer(unroutedIDs []int, unrouted map[int]Customer, depot Customer) int {
+	bestID := unroutedIDs[0]
+	bestDist := -1.0
+	for _, id := range unroutedIDs {
+		d := distance(depot, unrouted[id])
+		if d > bestDist || (d == bestDist && id < bestID) {
+			bestDist = d
+			bestID = id
+		}
+	}
+	return bestID
+}
+
+// serviceStartAt returns the service-start time at the customer occupying
+// position succIdx in a route, given that route's precomputed details. If
+// succIdx is out of range, the "successor" is the depot on the return leg
+// - calculateRouteDetails never records the depot in its time maps, so
+// that case is derived explicitly from the last customer's departure time.
+func serviceStartAt(r Route, customerIDs []int, succIdx int, customers map[int]Customer, depot Customer) float64 {
+	if succIdx < len(customerIDs) {
+		succID := customerIDs[succIdx]
+		return r.ArrivalTimes[succID] + r.WaitingTimes[succID]
+	}
+	if len(customerIDs) == 0 {
+		return 0
+	}
+	lastID := customerIDs[len(customerIDs)-1]
+	return r.DepartureTimes[lastID] + distance(customers[lastID], depot)
+}
+
+// i1c1 computes Solomon's c1(i,u,j) cost for inserting customer u at
+// position pos of routeCusts. baseRoute is routeCusts' precomputed details
+// (before insertion); candRoute is the already feasibility-checked route
+// WITH u inserted - both reused as-is, no recomputation.
+func i1c1(routeCusts []int, pos int, u Customer, customers map[int]Customer, depot Customer, baseRoute, candRoute Route) float64 {
+	prev := depot
+	if pos > 0 {
+		prev = customers[routeCusts[pos-1]]
+	}
+	next := depot
+	if pos < len(routeCusts) {
+		next = customers[routeCusts[pos]]
+	}
+
+	c11 := distance(prev, u) + distance(u, next) - i1Mu*distance(prev, next)
+	c12 := serviceStartAt(candRoute, candRoute.CustomerIDs, pos+1, customers, depot) -
+		serviceStartAt(baseRoute, routeCusts, pos, customers, depot)
+
+	return i1Alpha1*c11 + i1Alpha2*c12
 }
 
 // Calculate precise details of a route including distances, arrivals, service, wait times and feasibility
@@ -1575,7 +1555,7 @@ func shouldProbeLKHMinusOne(attempt int, destroyedRouteCount int) (probeVehicles
 }
 
 // invokeLKHSubSolver re-solves a set of destroyed customers using the native LKH3
-// binary (lkh_bin) instead of the pure-Go K-means+LNS sub-solver. LKH3 handles
+// binary (lkh_bin) instead of the pure-Go I1+LNS sub-solver. LKH3 handles
 // CVRPTW via a soft violation-penalty model, not hard constraints, so its output
 // is never trusted directly: every returned route is re-validated (and its
 // timing/load fields repopulated) through calculateRouteDetails, the same

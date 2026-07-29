@@ -30,7 +30,7 @@ touching:
    WASM (`public/wasm/solver.wasm`) and run in a browser Web Worker (`public/solverWorker.js`).
    It's also still buildable as a native CLI binary (`solver_bin`, via `./build_solver.sh`) for
    standalone testing/benchmarking outside the browser — nothing in the running app spawns this
-   binary anymore. It has K-means clustering for the initial solution, a pure-Go stagnation
+   binary anymore. It has a Solomon I1 sequential insertion heuristic for the initial solution, a pure-Go stagnation
    heuristic (`selectStagnationRoutesHeuristically`) as its default destroy-selection mechanism
    when stagnated, and an optional LKH3 sub-solver (see below).
 2. **TypeScript solver (`solver_engine.ts`)** — kept in the repo but **not used** anywhere. It was
@@ -45,7 +45,7 @@ one applies to the other.
 
 `solver/main.go` takes a `-use-lkh` flag (default `false`), exposed in the UI as the "Use LKH3 for
 stagnation sub-solving" toggle. When a stagnation intervention fires, instead of (or in addition
-to falling back on) the pure-Go K-means+LNS sub-solver, it can hand the destroyed customers to
+to falling back on) the pure-Go I1+LNS sub-solver, it can hand the destroyed customers to
 LKH3 — a C VRP/TSP solver — as `invokeLKHSubSolver` in `solver/main.go`. LKH3's output is never
 trusted directly (it uses a soft violation-penalty model, not hard constraints); every returned
 route is re-validated through `calculateRouteDetails`, the same feasibility check every other
@@ -183,7 +183,9 @@ this file's history were wrong (rc201's was actually rc103's value).
 
 ## Solver algorithm (Go path, `solver/main.go` — the one the web app runs, via WASM)
 
-- **Initial solution**: K-means clustering + insertion (`buildInitialSolution`).
+- **Initial solution**: Solomon I1 sequential insertion (`buildInitialSolution`) — one route at a
+  time from the full unrouted pool, seeded by farthest-from-depot, filled by c1 (distance +
+  time-window shift) / c2 (depot-distance regret) selection. No clustering pre-step.
 - **Vehicle-minimization pre-phase**: immediately after construction, before the main loop,
   repeatedly calls `tryRouteElimination` to shed routes while the solution is still loose.
   Budgeted at 10% of `-iterations`, logged under the `VEHICLE-MIN` category. See

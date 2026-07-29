@@ -56,13 +56,14 @@ directly; see "History" below.
 
 ## The Go solver (`solver/main.go` → `solver_bin`)
 
-- **Initial solution**: K-means clustering + insertion (`buildInitialSolution`).
+- **Initial solution**: Solomon I1 sequential insertion (`buildInitialSolution`) — one route at a
+  time from the full unrouted pool, no clustering pre-step.
 - **Destroy operators**: worst-distance and random removal.
 - **Repair**: greedy insertion.
 - **Acceptance**: always-accept on improvement; random destroys always accepted.
 - **Stagnation intervention**: after `-llm-threshold` iterations with no
-  improvement, destroys 2–5 routes and re-solves the freed customers via a
-  K-means + LNS sub-solver, escalating destroy size across up to 3 attempts.
+  improvement, destroys 2–5 routes and re-solves the freed customers via an
+  I1 + LNS sub-solver, escalating destroy size across up to 3 attempts.
   Route selection for this step is the pure-Go heuristic
   (`selectStagnationRoutesHeuristically`) by default, or Ollama
   (`invokeLLMToSelectTrucks`, via `/api/llm-destroy`) if `-use-llm=true` —
