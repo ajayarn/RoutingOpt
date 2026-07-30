@@ -160,7 +160,20 @@ self.fs = {
 // Relative (not "/wasm/...") - resolves against this worker script's own
 // URL regardless of whether the site is served from the domain root or a
 // GitHub Pages project subpath.
-importScripts("wasm/wasm_exec.js", "wasm/lkh_wasm.js");
+importScripts("wasm/wasm_exec.js");
+
+// lkh_wasm.js/.wasm are only needed when a solve actually passes
+// -use-lkh=true (see onmessage below) - loaded separately from wasm_exec.js
+// and wrapped in try/catch so a missing/stale LKH build artifact only
+// disables the optional LKH sub-solver for this session instead of breaking
+// every solve, including ones with the LKH toggle off.
+let lkhModuleAvailable = false;
+try {
+  importScripts("wasm/lkh_wasm.js");
+  lkhModuleAvailable = true;
+} catch (e) {
+  console.error("[lkh bridge] wasm/lkh_wasm.js unavailable - LKH sub-solver disabled for this session:", e);
+}
 
 // js.Value.Invoke() on the Go side (solver/lkh_wasm.go) blocks synchronously
 // until this JS function returns, so it must be synchronous - but
@@ -174,20 +187,30 @@ importScripts("wasm/wasm_exec.js", "wasm/lkh_wasm.js");
 const LKH_POOL_SIZE = 3;
 let lkhPool = [];
 let lkhPoolPrimed = false;
+let lkhPoolRefilling = false;
 
 async function refillLkhPool() {
-  while (lkhPool.length < LKH_POOL_SIZE) {
-    lkhPool.push(await LKHModule({
-      print: () => {},
-      printErr: (t) => console.error("[lkh-wasm]", t),
-      // Emscripten's own scriptDirectory detection resolves against this
-      // worker's own URL (self.location - importScripts doesn't change it),
-      // not wasm/lkh_wasm.js's URL, so left to its own devices it looks for
-      // lkh_wasm.wasm next to solverWorker.js instead of under wasm/ -
-      // works by coincidence when everything's at the domain root, breaks
-      // under any subpath (e.g. GitHub Pages). locateFile overrides that.
-      locateFile: (path) => "wasm/" + path,
-    }));
+  // __lkhWasmSolve fires refillLkhPool() after every pop without awaiting
+  // it; guard against overlapping refills racing each other and pushing the
+  // pool past LKH_POOL_SIZE.
+  if (lkhPoolRefilling) return;
+  lkhPoolRefilling = true;
+  try {
+    while (lkhPool.length < LKH_POOL_SIZE) {
+      lkhPool.push(await LKHModule({
+        print: () => {},
+        printErr: (t) => console.error("[lkh-wasm]", t),
+        // Emscripten's own scriptDirectory detection resolves against this
+        // worker's own URL (self.location - importScripts doesn't change it),
+        // not wasm/lkh_wasm.js's URL, so left to its own devices it looks for
+        // lkh_wasm.wasm next to solverWorker.js instead of under wasm/ -
+        // works by coincidence when everything's at the domain root, breaks
+        // under any subpath (e.g. GitHub Pages). locateFile overrides that.
+        locateFile: (path) => "wasm/" + path,
+      }));
+    }
+  } finally {
+    lkhPoolRefilling = false;
   }
 }
 
@@ -218,7 +241,15 @@ self.onmessage = async (event) => {
 
     if (args.useLkh && !lkhPoolPrimed) {
       lkhPoolPrimed = true;
-      await refillLkhPool();
+      if (lkhModuleAvailable) {
+        await refillLkhPool();
+      } else {
+        // Leave lkhPool empty: __lkhWasmSolve sees pool.length === 0 and
+        // returns null, which solver/lkh_wasm.go already treats as "LKH
+        // unavailable, fall back to the pure-Go sub-solver" - so a missing
+        // LKH build artifact degrades this one solve instead of failing it.
+        console.error("[lkh bridge] -use-lkh requested but LKH module never loaded; sub-solver will fall back to pure-Go heuristic.");
+      }
     }
 
     const go = new Go();

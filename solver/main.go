@@ -1,14 +1,12 @@
 package main
 
 import (
-	"bytes"
 	"bufio"
 	"encoding/json"
 	"flag"
 	"fmt"
 	"math"
 	"math/rand"
-	"net/http"
 	"os"
 	"sort"
 	"strconv"
@@ -81,8 +79,7 @@ func main() {
 	filePath := flag.String("file", "", "Path to the Solomon instance file")
 	iterations := flag.Int("iterations", 1000, "Number of LNS iterations")
 	seed := flag.Int64("seed", 42, "Random seed")
-	llmThreshold := flag.Int("llm-threshold", 20, "Iteration threshold for LLM intervention")
-	useLLM := flag.Bool("use-llm", false, "Use Ollama LLM via /api/llm-destroy instead of the pure-Go heuristic for stagnation destroy selection")
+	llmThreshold := flag.Int("llm-threshold", 20, "Iteration threshold for stagnation intervention")
 	useLKH := flag.Bool("use-lkh", false, "Use the native LKH3 binary instead of the pure-Go I1+LNS sub-solver for stagnation sub-solving")
 	flag.Parse()
 
@@ -253,45 +250,14 @@ func main() {
 				}
 
 				triggerCategory := "HEURISTIC:TRIGGER"
-				if *useLLM {
-					triggerCategory = "LLM:TRIGGER"
-				}
 				if attempt > 1 {
-					sendProgressLog(iter, bestSol, startTime, triggerCategory, "Stagnation solver Attempt %d: Retrying with alternate seed routes. Increasing destroy size limit to %d-%d routes.", attempt, minDestroyRoutes, maxDestroyRoutes)
-				} else if *useLLM {
-					sendProgressLog(iter, bestSol, startTime, triggerCategory, "Stagnation detected (stagnated for %d iters). Querying Ollama LLM (suggesting %d-%d routes to destroy).", stagnationCounter, minDestroyRoutes, maxDestroyRoutes)
+					sendProgressLog(iter, bestSol, startTime, triggerCategory, "Stagnation solver Attempt %d: Retrying with alternate seed routes (%d-%d routes).", attempt, minDestroyRoutes, maxDestroyRoutes)
 				} else {
 					sendProgressLog(iter, bestSol, startTime, triggerCategory, "Stagnation detected (stagnated for %d iters). Invoking Smart Heuristic routing analyzer (suggesting %d-%d routes to destroy).", stagnationCounter, minDestroyRoutes, maxDestroyRoutes)
 				}
 
-				// Select vehicles to destroy: Ollama LLM if enabled, else the pure Go heuristic
-				var finalDestroyIDs []int
 				decisionCategory := "HEURISTIC:DECISION"
-				if *useLLM {
-					finalDestroyIDs = invokeLLMToSelectTrucks(bestSol, name, history, minDestroyRoutes, maxDestroyRoutes)
-
-					// Validate returned IDs against the actual current route set before using them
-					validVehicleIDs := make(map[int]bool)
-					for _, r := range bestSol.Routes {
-						validVehicleIDs[r.VehicleID] = true
-					}
-					filtered := make([]int, 0, len(finalDestroyIDs))
-					for _, id := range finalDestroyIDs {
-						if validVehicleIDs[id] {
-							filtered = append(filtered, id)
-						}
-					}
-					finalDestroyIDs = filtered
-
-					if len(finalDestroyIDs) == 0 {
-						sendProgressLog(iter, bestSol, startTime, "LLM:FALLBACK", "Ollama unavailable or returned no valid vehicles; falling back to heuristic destroy.")
-						finalDestroyIDs = selectStagnationRoutesHeuristically(bestSol, history, minDestroyRoutes, maxDestroyRoutes, customerMap, attempt)
-					} else {
-						decisionCategory = "LLM:DECISION"
-					}
-				} else {
-					finalDestroyIDs = selectStagnationRoutesHeuristically(bestSol, history, minDestroyRoutes, maxDestroyRoutes, customerMap, attempt)
-				}
+				finalDestroyIDs := selectStagnationRoutesHeuristically(bestSol, history, minDestroyRoutes, maxDestroyRoutes, customerMap, attempt)
 				
 				if len(finalDestroyIDs) > 0 {
 					// Collect customer IDs of destroyed routes to add to history if it fails
@@ -451,16 +417,14 @@ func main() {
 							// Did not improve! Log and add to history, then retry
 							sendProgressLog(iter, bestSol, startTime, "HEURISTIC:FAILURE", "[FAILED] Attempt %d did not improve upon best known solution (%.2f). Retrying...", attempt, originalBestSol.TotalDistance)
 							history = append(history, DestructionAttempt{
-								VehicleIDs:  finalDestroyIDs,
-								CustomerIDs: destroyedCustIDs,
+								VehicleIDs: finalDestroyIDs,
 							})
 						}
 					}
 				} else {
 					sendProgressLog(iter, bestSol, startTime, "HEURISTIC:FAILURE", "[FAILED] Attempt %d generated no valid vehicles. Retrying...", attempt)
 					history = append(history, DestructionAttempt{
-						VehicleIDs:  finalDestroyIDs,
-						CustomerIDs: []int{},
+						VehicleIDs: finalDestroyIDs,
 					})
 				}
 			}
@@ -479,7 +443,7 @@ func main() {
 	}
 
 	// Send final results
-	sendResult(bestSol, startTime)
+	sendResult(bestSol, startTime, *iterations)
 }
 
 // Distance helper
@@ -832,6 +796,11 @@ func calculateRouteDetails(customerIDs []int, customers map[int]Customer, depot 
 func recalculateSolutionMetrics(sol *Solution) {
 	sol.TotalDistance = 0
 	sol.TotalVehicles = len(sol.Routes)
+	// Not re-derived here on purpose: every route ever placed into a
+	// Solution.Routes slice already passed calculateRouteDetails' hard
+	// capacity/time-window check at insertion time (this function runs on a
+	// hot path - called from every operator - so re-validating routes that
+	// are already known-feasible would be pure wasted work).
 	sol.IsFeasible = true
 
 	for i := range sol.Routes {
@@ -1616,41 +1585,15 @@ func sendProgress(iter int, sol Solution, startTime time.Time) {
 	fmt.Println(string(bytes))
 }
 
-func sendResult(sol Solution, startTime time.Time) {
+func sendResult(sol Solution, startTime time.Time, finalIteration int) {
 	msg := ProgressMessage{
 		Type:              "result",
+		Iteration:         finalIteration,
 		BestDistance:      sol.TotalDistance,
 		BestVehicles:      sol.TotalVehicles,
 		Routes:            sol.Routes,
 		ComputationTimeMs: time.Since(startTime).Milliseconds(),
 		Message:           "Optimization completed successfully.",
-	}
-	bytes, _ := json.Marshal(msg)
-	fmt.Println(string(bytes))
-}
-
-func sendResultWithMessage(sol Solution, startTime time.Time, message string) {
-	msg := ProgressMessage{
-		Type:              "result",
-		BestDistance:      sol.TotalDistance,
-		BestVehicles:      sol.TotalVehicles,
-		Routes:            sol.Routes,
-		ComputationTimeMs: time.Since(startTime).Milliseconds(),
-		Message:           message,
-	}
-	bytes, _ := json.Marshal(msg)
-	fmt.Println(string(bytes))
-}
-
-func sendProgressMessage(iter int, sol Solution, startTime time.Time, message string) {
-	msg := ProgressMessage{
-		Type:              "progress",
-		Iteration:         iter,
-		BestDistance:      sol.TotalDistance,
-		BestVehicles:      sol.TotalVehicles,
-		Routes:            sol.Routes,
-		ComputationTimeMs: time.Since(startTime).Milliseconds(),
-		Message:           message,
 	}
 	bytes, _ := json.Marshal(msg)
 	fmt.Println(string(bytes))
@@ -1672,8 +1615,7 @@ func sendProgressLog(iter int, sol Solution, startTime time.Time, category strin
 }
 
 type DestructionAttempt struct {
-	VehicleIDs  []int `json:"vehicleIds"`
-	CustomerIDs []int `json:"customerIds"`
+	VehicleIDs []int `json:"vehicleIds"`
 }
 
 func selectStagnationRoutesHeuristically(
@@ -2007,52 +1949,6 @@ func buildLKHInstanceText(destroyedCustomers []Customer, depot Customer, capacit
 	fmt.Fprintf(&instance, "DEPOT_SECTION\n1\n-1\nEOF\n")
 
 	return instance.String()
-}
-
-func invokeLLMToSelectTrucks(bestSol Solution, instanceName string, history []DestructionAttempt, minDestroy, maxDestroy int) []int {
-	type LLMRequest struct {
-		Routes       []Route              `json:"routes"`
-		InstanceName string               `json:"instanceName"`
-		History      []DestructionAttempt `json:"history"`
-		MinDestroy   int                  `json:"minDestroy"`
-		MaxDestroy   int                  `json:"maxDestroy"`
-	}
-
-	reqBody, err := json.Marshal(LLMRequest{
-		Routes:       bestSol.Routes,
-		InstanceName: instanceName,
-		History:      history,
-		MinDestroy:   minDestroy,
-		MaxDestroy:   maxDestroy,
-	})
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "Failed to marshal LLM request: %v\n", err)
-		return nil
-	}
-
-	url := "http://localhost:3000/api/llm-destroy"
-	client := &http.Client{Timeout: 15 * time.Second}
-	resp, err := client.Post(url, "application/json", bytes.NewBuffer(reqBody))
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "LLM HTTP request failed: %v\n", err)
-		return nil
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		fmt.Fprintf(os.Stderr, "LLM request returned status: %s\n", resp.Status)
-		return nil
-	}
-
-	var result struct {
-		VehicleIDs []int `json:"vehicleIds"`
-	}
-	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
-		fmt.Fprintf(os.Stderr, "Failed to decode LLM response: %v\n", err)
-		return nil
-	}
-
-	return result.VehicleIDs
 }
 
 func sendError(err string) {

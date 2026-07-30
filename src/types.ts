@@ -37,9 +37,6 @@ export interface SolverSolution {
 
 export interface SolverParams {
   maxIterations: number;
-  populationSize?: number;
-  mutationRate?: number;
-  destroyRate?: number;
   llmThreshold?: number;
   useLkh?: boolean;
 }
