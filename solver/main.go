@@ -118,12 +118,19 @@ func main() {
 		return
 	}
 
+	// 2a. Tighten the raw I1 construction with 2-opt/Or-opt before anything
+	// else touches it - route-elimination attempts below succeed more often
+	// against routes that aren't carrying distance/time slack the insertion
+	// heuristic left behind.
+	sol = localSearchImprove(sol, customerMap, depot, capacity)
+
 	// 2b. Vehicle-minimization pre-phase: while the solution is still loose
 	// (freshly constructed, not yet distance-optimized), aggressively try
 	// to eliminate routes before the main distance-focused loop starts. See
 	// docs/superpowers/specs/2026-07-27-route-elimination-operator-design.md.
 	prePhaseBudget := int(0.10 * float64(*iterations))
 	sol = runVehicleMinimizationPrePhase(sol, customerMap, depot, capacity, prePhaseBudget, startTime)
+	sol = localSearchImprove(sol, customerMap, depot, capacity)
 
 	// Send initial progress
 	sendProgress(0, sol, startTime)
@@ -167,6 +174,12 @@ func main() {
 			}
 			sendProgressLog(iter, bestSol, startTime, "LNS:CHOOSE", "Neighborhood '%s' selected to remove %d customers: %v", destroyType, k, removed)
 			candidateSol = repairGreedy(partialSol, removed, customerMap, depot, capacity)
+			// Tighten every repaired candidate before it's judged for
+			// acceptance - greedy insertion alone routinely leaves crossing
+			// edges and out-of-order visits that 2-opt/Or-opt can remove for
+			// free (Route Elimination's candidate is already tightened
+			// inside tryRouteElimination itself).
+			candidateSol = localSearchImprove(candidateSol, customerMap, depot, capacity)
 		}
 
 		// 3. Evaluate & Decide (Acceptance criterion)
@@ -395,6 +408,15 @@ func main() {
 									}
 								}
 								sendProgressLog(iter, bestSol, startTime, "HEURISTIC:SUB-SOLVER", "Phase 2 Complete. Subset LNS performed %d improvements. Final subset routing: %d vehicles, %.2f distance.", subImprovements, subSol.TotalVehicles, subSol.TotalDistance)
+							}
+
+							// subSol came out of buildInitialSolution + destroy/repair, neither
+							// of which does any intra/inter-route tightening - polish it before
+							// merging back into the full solution. Skipped for an LKH-sourced
+							// subSol (lkhHandled) since LKH already searches this far more
+							// thoroughly than a 2-opt/Or-opt pass over its output would add.
+							if !lkhHandled {
+								subSol = localSearchImprove(subSol, customerMap, depot, capacity)
 							}
 						}
 
@@ -1185,6 +1207,17 @@ func repairGreedyNoNewRoute(sol Solution, removed []int, customers map[int]Custo
 
 		rDetails, _ := calculateRouteDetails(newIDs, customers, depot, capacity)
 		rDetails.VehicleID = r.VehicleID
+		// Reshape the route with 2-opt right after this single insertion,
+		// not just once at the very end: a route left in whatever order
+		// greedy insertion happened to build can be so time-window-tight
+		// that the NEXT customer has nowhere feasible to go, even though a
+		// reordered version of the same route would have room. Measured on
+		// R204: without this, route elimination could never get below 3
+		// vehicles (200/200 consecutive attempts failed even after adding
+		// the retry loop below); with it, insertion has a chance to
+		// discover the slack 2-opt would have found anyway, before it's
+		// needed for the next customer rather than after.
+		rDetails = twoOptRoute(rDetails, customers, depot, capacity)
 		working.Routes[bestRouteIdx] = rDetails
 
 		delete(remaining, bestCustID)
@@ -1195,6 +1228,239 @@ func repairGreedyNoNewRoute(sol Solution, removed []int, customers map[int]Custo
 	}
 	recalculateSolutionMetrics(&working)
 	return working, true
+}
+
+// reversedSegment returns a copy of ids with the [i, j] (inclusive) slice
+// reversed - the core move of 2-opt.
+func reversedSegment(ids []int, i, j int) []int {
+	out := make([]int, len(ids))
+	copy(out, ids)
+	for lo, hi := i, j; lo < hi; lo, hi = lo+1, hi-1 {
+		out[lo], out[hi] = out[hi], out[lo]
+	}
+	return out
+}
+
+// twoOptRoute repeatedly applies the best-improving 2-opt move (reversing a
+// contiguous segment of the route) until a full pass over every segment
+// finds no further improvement. Reversing a segment changes visit order,
+// which time windows can turn infeasible even when the raw distance
+// improves - so every candidate is re-validated via calculateRouteDetails
+// rather than accepted on the distance delta alone. This is what the
+// solver was missing entirely before: destroy/repair only ever appended
+// customers at their cheapest insertion point, with nothing to untangle a
+// route afterward.
+func twoOptRoute(route Route, customers map[int]Customer, depot Customer, capacity float64) Route {
+	vehicleID := route.VehicleID
+	ids := route.CustomerIDs
+
+	improved := true
+	for improved {
+		improved = false
+		n := len(ids)
+		for i := 0; i < n-1; i++ {
+			for j := i + 1; j < n; j++ {
+				candidate := reversedSegment(ids, i, j)
+				details, ok := calculateRouteDetails(candidate, customers, depot, capacity)
+				if ok && details.Distance < route.Distance-1e-9 {
+					ids = candidate
+					route = details
+					improved = true
+				}
+			}
+		}
+	}
+
+	route.VehicleID = vehicleID
+	return route
+}
+
+// twoOptImproveSolution applies twoOptRoute independently to every route in
+// sol and recomputes solution-level totals. Vehicle count is unaffected -
+// this only reorders customers within each existing route, never moves one
+// across routes (that's orOptImproveSolution's job).
+func twoOptImproveSolution(sol Solution, customers map[int]Customer, depot Customer, capacity float64) Solution {
+	improved := cloneSolution(sol)
+	for i := range improved.Routes {
+		improved.Routes[i] = twoOptRoute(improved.Routes[i], customers, depot, capacity)
+	}
+	recalculateSolutionMetrics(&improved)
+	return improved
+}
+
+// orOptImproveSolution repeatedly looks for a single customer whose best
+// feasible reinsertion point (via findBestInsertion, searched across every
+// route including its own current one) is cheaper than leaving it where it
+// is, and relocates it there. Unlike twoOptRoute, this can move a customer
+// into a completely different route - the "cross-route relocate" that
+// DESIGN.md notes the TS engine has and the Go engine, until now, didn't.
+// Runs to convergence (a full pass with no improving move) or maxPasses
+// sweeps, whichever comes first: with time windows, one relocation can
+// occasionally re-open a move that looked unprofitable earlier in the same
+// pass, so a single pass isn't always enough to reach a local optimum.
+func orOptImproveSolution(sol Solution, customers map[int]Customer, depot Customer, capacity float64, maxPasses int) Solution {
+	improved := cloneSolution(sol)
+
+	for pass := 0; pass < maxPasses; pass++ {
+		anyImprovement := false
+
+		var allCustIDs []int
+		for _, r := range improved.Routes {
+			allCustIDs = append(allCustIDs, r.CustomerIDs...)
+		}
+
+		for _, cID := range allCustIDs {
+			fromRouteIdx := -1
+			for rIdx, r := range improved.Routes {
+				for _, id := range r.CustomerIDs {
+					if id == cID {
+						fromRouteIdx = rIdx
+						break
+					}
+				}
+				if fromRouteIdx != -1 {
+					break
+				}
+			}
+			if fromRouteIdx == -1 {
+				continue // shouldn't happen - defensive only
+			}
+
+			originalRoute := improved.Routes[fromRouteIdx]
+			withoutIDs := make([]int, 0, len(originalRoute.CustomerIDs)-1)
+			for _, id := range originalRoute.CustomerIDs {
+				if id != cID {
+					withoutIDs = append(withoutIDs, id)
+				}
+			}
+
+			withoutDetails, ok := calculateRouteDetails(withoutIDs, customers, depot, capacity)
+			if !ok {
+				continue // removing a customer can't break feasibility; defensive only
+			}
+			removalSavings := originalRoute.Distance - withoutDetails.Distance
+
+			trial := make([]Route, len(improved.Routes))
+			copy(trial, improved.Routes)
+			withoutDetails.VehicleID = originalRoute.VehicleID
+			trial[fromRouteIdx] = withoutDetails
+
+			bestRouteIdx, bestPos, insCost, _, feasible := findBestInsertion(trial, cID, customers, depot, capacity)
+			if !feasible || insCost >= removalSavings-1e-9 {
+				continue // no feasible or no net-improving relocation
+			}
+
+			r := &trial[bestRouteIdx]
+			newIDs := make([]int, len(r.CustomerIDs)+1)
+			copy(newIDs[:bestPos], r.CustomerIDs[:bestPos])
+			newIDs[bestPos] = cID
+			copy(newIDs[bestPos+1:], r.CustomerIDs[bestPos:])
+			rDetails, _ := calculateRouteDetails(newIDs, customers, depot, capacity)
+			rDetails.VehicleID = r.VehicleID
+			trial[bestRouteIdx] = rDetails
+
+			improved.Routes = trial
+			anyImprovement = true
+		}
+
+		recalculateSolutionMetrics(&improved)
+		if !anyImprovement {
+			break
+		}
+	}
+
+	// Relocating every customer out of a route (e.g. because merging into
+	// one bigger route was cheaper than keeping two) leaves that route with
+	// zero customers - recalculateSolutionMetrics still counts it as a
+	// vehicle (TotalVehicles = len(Routes)), which would silently inflate
+	// the solution's primary objective. Drop empty routes and reindex
+	// before handing the result back; this also means Or-opt can discover
+	// route elimination as a side effect, not just distance improvements.
+	nonEmpty := make([]Route, 0, len(improved.Routes))
+	for _, r := range improved.Routes {
+		if len(r.CustomerIDs) > 0 {
+			nonEmpty = append(nonEmpty, r)
+		}
+	}
+	for idx := range nonEmpty {
+		nonEmpty[idx].VehicleID = idx + 1
+	}
+	improved.Routes = nonEmpty
+	recalculateSolutionMetrics(&improved)
+
+	return improved
+}
+
+// localSearchImprove alternates twoOptRoute (intra-route reordering) and
+// orOptImproveSolution (cross-route relocation) until a full round of both
+// yields no further distance improvement, or maxRounds is hit. Alternating
+// rather than running either just once matters because each can re-open
+// opportunities for the other: an Or-opt relocation can leave a route in a
+// shape 2-opt can now untangle further, and vice versa.
+func localSearchImprove(sol Solution, customers map[int]Customer, depot Customer, capacity float64) Solution {
+	improved := sol
+	const maxRounds = 5
+	for round := 0; round < maxRounds; round++ {
+		before := improved.TotalDistance
+		improved = twoOptImproveSolution(improved, customers, depot, capacity)
+		improved = orOptImproveSolution(improved, customers, depot, capacity, 3)
+		if improved.TotalDistance >= before-1e-6 {
+			break
+		}
+	}
+	return improved
+}
+
+// routeEliminationShuffleBudget bounds how many "yank some survivors back
+// out too" retries eliminateOneRoute makes after a direct one-shot
+// reinsertion fails. See eliminateOneRoute for why this is needed at all.
+const routeEliminationShuffleBudget = 5
+
+// eliminateOneRoute tries to fold routeIdx's customers into the OTHER
+// routes of sol without opening a new one. It first tries the direct,
+// cheap path: reinsert the evicted customers into the survivors exactly as
+// they are (repairGreedyNoNewRoute). On R204 (100 customers, 2 routes of
+// ~50 each at the target fleet size) this direct path was measured to fail
+// 200/200 times even after adding 2-opt reshaping inside the insertion
+// loop itself - because the survivors' own customers never move, "no
+// slack anywhere in either fixed survivor order" is a real dead end, not
+// just an unlucky insertion order, however many times you retry it as-is.
+// So on failure, this also frees a random slice of the survivors' OWN
+// customers back into the same repair alongside the evictees, giving the
+// search room to reshuffle both sides at once rather than only ever
+// inserting into an immovable skeleton.
+func eliminateOneRoute(sol Solution, routeIdx int, customers map[int]Customer, depot Customer, capacity float64) (Solution, bool) {
+	partialSol, removed := destroyRouteElimination(sol, routeIdx)
+
+	if repaired, ok := repairGreedyNoNewRoute(partialSol, removed, customers, depot, capacity); ok {
+		return localSearchImprove(repaired, customers, depot, capacity), true
+	}
+
+	survivorCount := 0
+	for _, r := range partialSol.Routes {
+		survivorCount += len(r.CustomerIDs)
+	}
+	k := int(math.Max(3, float64(survivorCount)*0.15))
+
+	for shuffle := 0; shuffle < routeEliminationShuffleBudget; shuffle++ {
+		var shuffledPartial Solution
+		var extraRemoved []int
+		if shuffle%2 == 0 {
+			shuffledPartial, extraRemoved = destroyWorst(partialSol, k, customers, depot)
+		} else {
+			shuffledPartial, extraRemoved = destroyRandom(partialSol, k, customers, depot)
+		}
+
+		allRemoved := make([]int, 0, len(removed)+len(extraRemoved))
+		allRemoved = append(allRemoved, removed...)
+		allRemoved = append(allRemoved, extraRemoved...)
+
+		if repaired, ok := repairGreedyNoNewRoute(shuffledPartial, allRemoved, customers, depot, capacity); ok {
+			return localSearchImprove(repaired, customers, depot, capacity), true
+		}
+	}
+
+	return sol, false
 }
 
 // tryRouteElimination attempts to eliminate a route, trying up to
@@ -1214,9 +1480,7 @@ func tryRouteElimination(sol Solution, customers map[int]Customer, depot Custome
 	}
 
 	for i := 0; i < maxAttempts; i++ {
-		partialSol, removed := destroyRouteElimination(sol, ranked[i])
-		repaired, ok := repairGreedyNoNewRoute(partialSol, removed, customers, depot, capacity)
-		if ok {
+		if repaired, ok := eliminateOneRoute(sol, ranked[i], customers, depot, capacity); ok {
 			return repaired, true
 		}
 	}
@@ -1224,20 +1488,45 @@ func tryRouteElimination(sol Solution, customers map[int]Customer, depot Custome
 	return sol, false
 }
 
+// vehicleMinMaxConsecutiveFailures bounds how many attempts in a row
+// runVehicleMinimizationPrePhase will retry against the SAME vehicle count
+// before concluding elimination is genuinely stuck and giving up early,
+// independent of how large the caller's `budget` is. Without this, a
+// `budget` derived from a huge -iterations value (10% of it) could spin for
+// the entire prephase on a truly-infeasible elimination.
+//
+// This was originally 200, reasoned to be "cheap to retry" - true for a
+// single fixed-skeleton repairGreedyNoNewRoute call, but eliminateOneRoute
+// now escalates to routeEliminationShuffleBudget extra full repair attempts
+// per failure, and measured on R204 (100 customers, routes of ~13-47) each
+// eliminateOneRoute call can take up to several seconds. At 200 that
+// measured as the prephase consuming several *minutes* on a partition that
+// - per TestR204EliminationPerRoute - fails for every route in the
+// solution regardless of retry count: it's a genuine structural dead end
+// for this specific customer-to-route split, not bad luck, so more retries
+// just burn the time budget the main LNS loop needs to reach a DIFFERENT
+// split (via its unrestricted destroy/repair) where elimination might
+// actually succeed. 10 keeps a failing case cheap without giving up
+// instantly.
+const vehicleMinMaxConsecutiveFailures = 10
+
 // runVehicleMinimizationPrePhase attempts to reduce vehicle count as far as
 // possible while the solution is still loose (freshly constructed, not yet
 // distance-optimized) - see
 // docs/superpowers/specs/2026-07-27-route-elimination-operator-design.md
-// for why this runs up front rather than only reactively. Stops as soon as
-// any of the following happens: a route-elimination attempt fails (this is
-// NOT proof no further reduction is possible - repairGreedyNoNewRoute picks
-// its insertion order via Go map iteration, which is runtime-randomized
-// even under a fixed -seed, so an immediate retry against the identical
-// solution could still succeed; stopping here is a deliberate cost bound,
-// not a correctness guarantee), the capacity lower bound is reached, or
-// budget attempts are used up.
+// for why this runs up front rather than only reactively. A single
+// route-elimination failure is NOT proof no further reduction is possible -
+// repairGreedyNoNewRoute picks its insertion order via Go map iteration,
+// which is runtime-randomized even under a fixed -seed, so an immediate
+// retry against the identical solution can succeed where the last one
+// didn't (this was previously treated as terminal, which left runs stuck
+// one vehicle above what a few more retries would have found). Stops when
+// the capacity lower bound is reached, `budget` attempts are used up, or
+// vehicleMinMaxConsecutiveFailures attempts in a row fail at the same
+// vehicle count.
 func runVehicleMinimizationPrePhase(sol Solution, customers map[int]Customer, depot Customer, capacity float64, budget int, startTime time.Time) Solution {
 	lowerBound := minVehiclesLowerBound(customers, capacity)
+	consecutiveFailures := 0
 
 	for attempt := 1; attempt <= budget; attempt++ {
 		if sol.TotalVehicles <= lowerBound {
@@ -1247,9 +1536,14 @@ func runVehicleMinimizationPrePhase(sol Solution, customers map[int]Customer, de
 
 		newSol, ok := tryRouteElimination(sol, customers, depot, capacity, 3)
 		if !ok {
-			sendProgressLog(0, sol, startTime, "VEHICLE-MIN", "No further route elimination possible after %d attempt(s); stalled at %d vehicles (capacity floor %d)", attempt, sol.TotalVehicles, lowerBound)
-			return sol
+			consecutiveFailures++
+			if consecutiveFailures >= vehicleMinMaxConsecutiveFailures {
+				sendProgressLog(0, sol, startTime, "VEHICLE-MIN", "No further route elimination possible after %d consecutive failed attempt(s); stalled at %d vehicles (capacity floor %d)", consecutiveFailures, sol.TotalVehicles, lowerBound)
+				return sol
+			}
+			continue
 		}
+		consecutiveFailures = 0
 
 		sol = newSol
 		sendProgressLog(0, sol, startTime, "VEHICLE-MIN", "Eliminated a route on attempt %d - now %d vehicles, %.2f distance", attempt, sol.TotalVehicles, sol.TotalDistance)
