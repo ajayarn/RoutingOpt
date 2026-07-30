@@ -89,8 +89,9 @@ var destroyOperatorNames = []string{"Route Elimination", "Worst Destroy", "Rando
 //   - alnsReward{NewBest,Improved,Accepted}: what an operator earns for
 //     this iteration's outcome, in decreasing order of desirability. Purely
 //     relative to each other, not absolute - only the ratio matters.
-//   - alnsMinWeight: floor so one bad segment can't zero an operator out
-//     permanently; it can still occasionally be tried and earn its way back.
+//   - alnsMinWeight: floor guarding against a weight collapsing to zero.
+//     Not currently reachable from a live solve (see reward's doc comment) -
+//     kept as a safety net for whenever rejections start being credited.
 const (
 	alnsSegmentLength  = 50
 	alnsReactionFactor = 0.2
@@ -149,9 +150,11 @@ func (a *alnsWeights) choose(roll float64) int {
 }
 
 // reward credits opIdx's segment score for this iteration's outcome. Call
-// with one of the alnsReward* constants, or don't call at all for a
-// rejected candidate (worth 0, same effect as not calling but this also
-// avoids counting rejections toward segmentUsage's average).
+// with one of the alnsReward* constants; a rejected candidate isn't
+// credited at all here, which deviates from canonical ALNS (Ropke &
+// Pisinger score rejections at 0, pulling a frequently-rejected operator's
+// average down) - see README.md's ALNS section for the practical
+// consequence (weights can't actually be penalized below their 1.0 start).
 func (a *alnsWeights) reward(opIdx int, score float64) {
 	a.segmentScore[opIdx] += score
 	a.segmentUsage[opIdx]++

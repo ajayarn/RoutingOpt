@@ -182,14 +182,26 @@ Shaw) is drawn uniformly from `[max(2, 5% of customers), max(5, 30% of customers
 ### Destroy operators - adaptive (ALNS) selection
 
 Rather than a fixed split, which operator fires each iteration is chosen by roulette wheel over
-weights that adapt to what's actually been productive on *this* instance (`alnsWeights`, following
-Ropke & Pisinger's adaptive large neighborhood search scheme): every operator starts at weight 1.0;
-each iteration's chosen operator is credited a score based on its outcome (new global best > tied-
-vehicle improvement > accepted-but-worse > nothing for a rejected candidate); every 50 iterations,
-weights are updated from each operator's average score that segment (`w = w·(1−r) + r·avgScore`,
-reaction factor `r = 0.2`), floored so a bad segment can't zero an operator out permanently. An
-operator that wasn't tried at all that segment keeps its weight unchanged - only firing-but-
-unproductive is penalized, never being unlucky enough not to get picked.
+weights that adapt to what's actually been productive on *this* instance (`alnsWeights`, loosely
+following Ropke & Pisinger's adaptive large neighborhood search scheme): every operator starts at
+weight 1.0; each iteration's chosen operator is credited a score based on its outcome (new global
+best > tied-vehicle improvement > accepted-but-worse); every 50 iterations, weights are updated
+from each operator's average score that segment (`w = w·(1−r) + r·avgScore`, reaction factor
+`r = 0.2`).
+
+**Deviation from canonical ALNS, worth knowing before you tune it:** a *rejected* candidate is not
+credited at all (score 0 is never recorded) - `segmentUsage` for that operator simply isn't
+incremented, which is indistinguishable from the operator not having been picked that segment.
+Ropke & Pisinger's original scheme includes rejections in the average (a score of 0 pulls the
+average down), so a frequently-rejected operator loses weight there; here it just doesn't gain any.
+The practical effect: since every recorded score is ≥1 (`alnsRewardAccepted`), and weight is a
+convex combination of its old value and that average, weight is monotonically non-decreasing from
+its 1.0 starting point in practice - `alnsMinWeight = 0.1` is a safety floor that's reachable in
+the unit tests (which call `reward` with a score of 0 directly) but not in a live solve. Operators
+still differentiate over time (whichever is more often *productive* pulls ahead faster), just not
+via the "penalize a bad operator" mechanism the constant's name implies. Fixing this properly
+(crediting rejections with score 0) is a real change to search behavior, not a doc fix - it needs
+its own before/after benchmark rather than being bundled silently into this pass.
 
 | Operator | Mechanism |
 |---|---|
@@ -302,7 +314,10 @@ hence the visible gap. See [`R204_IMPROVEMENT_REPORT.md`](R204_IMPROVEMENT_REPOR
 session log from before this pass's algorithm changes.
 
 **Before/after this pass's algorithm changes** (Shaw removal, ALNS adaptive weighting, simulated
-annealing, relatedness-aware stagnation selection), same exact run condition:
+annealing, relatedness-aware stagnation selection), same exact run condition. **This is a single
+seed, single run per instance per side (n=1) - a spot check, not a benchmark sweep.** LNS is a
+randomized search, so a one-seed delta like this is suggestive, not statistically conclusive; a
+real claim would need several seeds per instance (see "Known limitations"):
 
 | Instance | Before | After | Change |
 |---|---|---|---|
@@ -310,14 +325,15 @@ annealing, relatedness-aware stagnation selection), same exact run condition:
 | R204 | 2 vehicles / 870.86 (601s) | 2 vehicles / 861.24 (454s) | **1.10% shorter distance, 24% faster** |
 
 R204 - the harder of the two instances in this repo's own testing - got measurably better *and*
-faster from the same iteration budget, which is the result these changes were made for: C101 was
-already solved, so there was nowhere for the new operators to show their value; R204's tighter
-capacity bound and wider time windows are exactly the kind of harder search space a relatedness-
-aware removal operator and an adaptive operator mix should help with most.
+faster from the same iteration budget on this seed, which is the direction these changes were made
+for: C101 was already solved, so there was nowhere for the new operators to show their value;
+R204's tighter capacity bound and wider time windows are exactly the kind of harder search space a
+relatedness-aware removal operator and an adaptive operator mix should help with most. Treat the
+magnitude (1.10%/24%) as one data point, not an expected effect size.
 
 Results were not run in this pass across the full 56-instance Solomon/Homberger set bundled in
-`public/data/` — that would be a natural next step for anyone forking this to benchmark
-systematically.
+`public/data/`, nor across multiple seeds per instance (the before/after table above is n=1 per
+side) — both would be natural next steps for anyone forking this to benchmark systematically.
 
 ## Known limitations / places to improve
 
@@ -327,9 +343,14 @@ order an OR practitioner would probably want to attack them:
 
 - **ALNS reward/reaction-factor constants are hand-picked, not tuned.** The segment length (50),
   reaction factor (0.2), and reward ratios (15/5/1 for new-best/improved/accepted) are reasonable
-  defaults, not the result of any tuning sweep on this instance set - if the operator mix looks
-  wrong on a given instance (e.g. Shaw Destroy's weight collapsing to the floor early), this is the
-  first place to look.
+  defaults, not the result of any tuning sweep on this instance set.
+- **Rejected candidates aren't credited toward their operator's segment average, unlike canonical
+  ALNS.** See the deviation callout above - weights currently only ever hold steady or climb from
+  their 1.0 starting point, never actually get penalized below it, so `alnsMinWeight` never engages
+  outside unit tests. The operator mix still adapts (productive operators pull ahead faster), just
+  not via the "demote a bad operator" mechanism the design implies. Crediting rejections with score
+  0 would fix this but changes search behavior - needs its own before/after benchmark, not a silent
+  bundle into a future pass.
 - **Shaw removal's relatedness weights (9/3/2 for distance/time/demand) are fixed**, following the
   literature's typical distance-dominant ratio rather than being tuned per instance - R1/RC1
   instances with tighter time windows might benefit from weighting the time term more heavily.
