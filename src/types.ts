@@ -30,7 +30,6 @@ export interface SolverSolution {
   routes: Route[];
   totalDistance: number;
   totalVehicles: number;
-  isFeasible: boolean;
   computationTimeMs: number;
   iteration?: number;
 }

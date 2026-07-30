@@ -38,7 +38,6 @@ type Solution struct {
 	Routes        []Route `json:"routes"`
 	TotalDistance float64 `json:"totalDistance"`
 	TotalVehicles int     `json:"totalVehicles"`
-	IsFeasible    bool    `json:"isFeasible"`
 }
 
 type ProgressMessage struct {
@@ -796,12 +795,6 @@ func calculateRouteDetails(customerIDs []int, customers map[int]Customer, depot 
 func recalculateSolutionMetrics(sol *Solution) {
 	sol.TotalDistance = 0
 	sol.TotalVehicles = len(sol.Routes)
-	// Not re-derived here on purpose: every route ever placed into a
-	// Solution.Routes slice already passed calculateRouteDetails' hard
-	// capacity/time-window check at insertion time (this function runs on a
-	// hot path - called from every operator - so re-validating routes that
-	// are already known-feasible would be pure wasted work).
-	sol.IsFeasible = true
 
 	for i := range sol.Routes {
 		sol.TotalDistance += sol.Routes[i].Distance
@@ -1558,7 +1551,6 @@ func cloneSolution(sol Solution) Solution {
 		Routes:        clonedRoutes,
 		TotalDistance: sol.TotalDistance,
 		TotalVehicles: sol.TotalVehicles,
-		IsFeasible:    sol.IsFeasible,
 	}
 }
 

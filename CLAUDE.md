@@ -103,7 +103,16 @@ preprocessing pass — abandoned in favor of the header-patching approach above.
     pre-instantiated LKH module instances rather than one shared instance — LKH's C globals are
     never reset between `callMain` calls within a single module instance, so reusing one instance
     across sub-solve calls risks stale-state corruption. Each call pops a fresh instance and an
-    async refill tops the pool back up in the background.
+    async refill (guarded against overlapping itself - see `lkhPoolRefilling`) tops the pool back
+    up in the background.
+    - **Known issue**: an occasional Emscripten `ErrnoError` from inside one `__lkhWasmSolve` call
+      (root cause not yet isolated - reproduced under an aggressive stagnation-threshold stress
+      test, pre-dates this cleanup pass) can leave the pool permanently unable to refill for the
+      rest of that solve, after which every stagnation intervention silently falls back to the
+      pure-Go sub-solver instead of LKH3 for the remainder of the run. Results stay correct
+      (feasibility is still enforced, see "Feasibility") - this only degrades solve *quality* by
+      losing the LKH boost, silently. Worth root-causing if `-use-lkh` runs are ending up
+      LKH-less more often than expected.
   - stdout (`fmt.Println(json)` in `main.go`) is line-buffered in the shim and forwarded to the
     main thread via `postMessage` instead of `console.log`, preserving the same
     one-JSON-message-per-line protocol the old SSE relay used.

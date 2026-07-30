@@ -388,7 +388,6 @@ export default function App() {
             routes: msg.routes,
             totalDistance: msg.bestDistance,
             totalVehicles: msg.bestVehicles,
-            isFeasible: true,
             computationTimeMs: msg.computationTimeMs || 0,
             iteration: msg.iteration
           };
@@ -415,7 +414,6 @@ export default function App() {
             routes: msg.routes,
             totalDistance: msg.bestDistance,
             totalVehicles: msg.bestVehicles,
-            isFeasible: true,
             computationTimeMs: msg.computationTimeMs || 0,
             iteration: msg.iteration ?? params.maxIterations
           };
@@ -538,7 +536,6 @@ export default function App() {
       routes,
       totalDistance,
       totalVehicles,
-      isFeasible: true,
       computationTimeMs: 0,
       iteration: 0
     };

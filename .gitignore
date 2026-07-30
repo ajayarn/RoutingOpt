@@ -11,3 +11,6 @@ lkh3src/OBJ_WASM/
 lkh_wasm_build/
 tools/emsdk/
 .superpowers/
+# Stray binary `go build ./...` (no -o) produces in solver/, named after
+# go.mod's module - not the intentional build outputs (solver_bin, wasm).
+solver/routingopt-solver
