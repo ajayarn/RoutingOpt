@@ -176,7 +176,7 @@ export default function App() {
   // Solver parameters
   const [params, setParams] = useState<SolverParams>({
     maxIterations: 1000,
-    llmThreshold: 20,
+    stagnationThreshold: 20,
     useLkh: false
   });
 
@@ -191,7 +191,7 @@ export default function App() {
   const [progressHistory, setProgressHistory] = useState<Array<{ iteration: number; distance: number; vehicles: number }>>([]);
   const [activeMessage, setActiveMessage] = useState<string>('');
   const [solverLogs, setSolverLogs] = useState<string[]>([]);
-  const [logFilter, setLogFilter] = useState<'all' | 'improvements' | 'llm' | 'lns'>('all');
+  const [logFilter, setLogFilter] = useState<'all' | 'improvements' | 'heuristic' | 'lns'>('all');
   const [elapsedTime, setElapsedTime] = useState(0);
 
   // UI Selection states
@@ -448,7 +448,7 @@ export default function App() {
       instanceText,
       args: {
         iterations: params.maxIterations,
-        llmThreshold: params.llmThreshold ?? 20,
+        stagnationThreshold: params.stagnationThreshold ?? 20,
         useLkh: !!params.useLkh,
         seed: Date.now(),
       }
@@ -650,21 +650,21 @@ export default function App() {
             {/* Stagnation Threshold */}
             <div className="mb-6">
               <div className="flex justify-between items-center mb-1.5">
-                <label className="block text-xs font-semibold text-slate-600" htmlFor="llm-threshold-input">
+                <label className="block text-xs font-semibold text-slate-600" htmlFor="stagnation-threshold-input">
                   Stagnation Threshold
                 </label>
                 <span className="text-xs text-blue-600 font-bold font-mono">
-                  {params.llmThreshold === 0 ? 'Disabled' : `Iter ${params.llmThreshold}`}
+                  {params.stagnationThreshold === 0 ? 'Disabled' : `Iter ${params.stagnationThreshold}`}
                 </span>
               </div>
               <input
-                id="llm-threshold-input"
+                id="stagnation-threshold-input"
                 type="number"
                 min="0"
                 max={params.maxIterations}
-                value={params.llmThreshold ?? 20}
+                value={params.stagnationThreshold ?? 20}
                 disabled={isSolving}
-                onChange={(e) => setParams(prev => ({ ...prev, llmThreshold: Math.max(0, parseInt(e.target.value) || 0) }))}
+                onChange={(e) => setParams(prev => ({ ...prev, stagnationThreshold: Math.max(0, parseInt(e.target.value) || 0) }))}
                 className="w-full text-sm border border-slate-300 rounded-lg p-2 bg-white focus:border-blue-500 focus:ring-1 focus:ring-blue-500 disabled:opacity-50"
               />
               <p className="text-[11px] text-slate-400 mt-1.5 leading-normal">
@@ -1250,18 +1250,18 @@ export default function App() {
 
                 {/* Filter Pills */}
                 <div className="flex flex-wrap gap-1 text-[10px]">
-                  {(['all', 'improvements', 'llm', 'lns'] as const).map((filter) => {
+                  {(['all', 'improvements', 'heuristic', 'lns'] as const).map((filter) => {
                     const label = {
                       all: 'All',
                       improvements: '🏆 Improvements',
-                      llm: '🧠 Smart Heuristic',
+                      heuristic: '🧠 Smart Heuristic',
                       lns: '⚡ LNS',
                     }[filter];
 
                     const activeStyle = {
                       all: 'bg-slate-700 text-white',
                       improvements: 'bg-emerald-800/80 text-emerald-200 border-emerald-700/50',
-                      llm: 'bg-violet-900 text-violet-200 border-violet-800',
+                      heuristic: 'bg-violet-900 text-violet-200 border-violet-800',
                       lns: 'bg-blue-900/60 text-blue-200 border-blue-800',
                     }[filter];
 
@@ -1295,7 +1295,7 @@ export default function App() {
                       if (logFilter === 'improvements') {
                         return log.includes('[NEW BEST]') || log.includes('[SUCCESS]') || log.includes('0.1%') || log.includes('Initial solution') || log.includes('started') || log.includes('results');
                       }
-                      if (logFilter === 'llm') {
+                      if (logFilter === 'heuristic') {
                         return log.includes('[HEURISTIC:') || log.includes('[LKH:') || log.includes('Heuristic') || log.includes('LKH') || log.includes('Bypassing') || log.includes('Attempt');
                       }
                       if (logFilter === 'lns') {

@@ -36,7 +36,7 @@ export interface SolverSolution {
 
 export interface SolverParams {
   maxIterations: number;
-  llmThreshold?: number;
+  stagnationThreshold?: number;
   useLkh?: boolean;
 }
 

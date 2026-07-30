@@ -214,9 +214,30 @@ async function refillLkhPool() {
   }
 }
 
+// A known intermittent bug (root cause not yet isolated - see CLAUDE.md's
+// "Client-side execution" section) can leave the pool stuck at 0 and unable
+// to refill for the rest of a run once one call throws. Rather than root-
+// causing the Emscripten-level failure, this bounds its blast radius: after
+// LKH_MAX_CONSECUTIVE_FAILURES failures/exhaustions in a row (reset to 0 by
+// any successful call), tear the pool down and rebuild it from scratch
+// instead of trusting the incremental refill to recover on its own.
+const LKH_MAX_CONSECUTIVE_FAILURES = 5;
+let lkhConsecutiveFailures = 0;
+
+function recreateLkhPool() {
+  console.error(`[lkh bridge] ${lkhConsecutiveFailures} consecutive failures - tearing down and recreating the LKH module pool`);
+  lkhPool = [];
+  lkhConsecutiveFailures = 0;
+  refillLkhPool(); // async top-up, same fire-and-forget pattern as every other refill call
+}
+
 self.__lkhWasmSolve = function (instanceText, parText) {
   if (lkhPool.length === 0) {
     console.error("[lkh bridge] pool exhausted, falling back to pure-Go sub-solver");
+    lkhConsecutiveFailures++;
+    if (lkhConsecutiveFailures >= LKH_MAX_CONSECUTIVE_FAILURES) {
+      recreateLkhPool();
+    }
     return null;
   }
   const Module = lkhPool.pop();
@@ -225,9 +246,15 @@ self.__lkhWasmSolve = function (instanceText, parText) {
     Module.FS.writeFile("/lkh_sub.vrptw", instanceText);
     Module.FS.writeFile("/lkh_sub.par", parText);
     Module.callMain(["/lkh_sub.par"]);
-    return Module.FS.readFile("/lkh_sub.sol", { encoding: "utf8" });
+    const result = Module.FS.readFile("/lkh_sub.sol", { encoding: "utf8" });
+    lkhConsecutiveFailures = 0;
+    return result;
   } catch (e) {
     console.error("[lkh bridge] call failed:", e);
+    lkhConsecutiveFailures++;
+    if (lkhConsecutiveFailures >= LKH_MAX_CONSECUTIVE_FAILURES) {
+      recreateLkhPool();
+    }
     return null;
   }
 };
@@ -257,7 +284,7 @@ self.onmessage = async (event) => {
       "js",
       "-file", "/instance.txt",
       "-iterations", String(args.iterations),
-      "-llm-threshold", String(args.llmThreshold),
+      "-stagnation-threshold", String(args.stagnationThreshold),
       "-seed", String(args.seed),
       `-use-lkh=${!!args.useLkh}`,
     ];

@@ -52,42 +52,179 @@ type ProgressMessage struct {
 
 // shouldTriggerStagnationSolver decides whether to invoke the stagnation-solver
 // intervention this iteration: whenever the global best has gone unchanged for
-// llmThreshold iterations. stagnationCounter is reset to 0 by the caller each
+// stagnationThreshold iterations. stagnationCounter is reset to 0 by the caller each
 // time this fires (and each time a new global best is found), which is what
 // throttles repeat firings - no additional gating is needed here.
-func shouldTriggerStagnationSolver(stagnationCounter, llmThreshold, totalIterations int) bool {
-	return llmThreshold > 0 && stagnationCounter >= llmThreshold && totalIterations >= llmThreshold
+func shouldTriggerStagnationSolver(stagnationCounter, stagnationThreshold, totalIterations int) bool {
+	return stagnationThreshold > 0 && stagnationCounter >= stagnationThreshold && totalIterations >= stagnationThreshold
 }
 
-// chooseDestroyOperator maps a uniform random roll in [0, 1) to a destroy
-// operator name using the 20% Route Elimination / 40% Worst / 40% Random
-// split. Extracted as a pure function so the split itself is unit-testable
-// without running a full solve.
-func chooseDestroyOperator(roll float64) string {
-	switch {
-	case roll < 0.20:
-		return "Route Elimination"
-	case roll < 0.60:
-		return "Worst Destroy"
-	default:
-		return "Random Destroy"
+// isBetterSolution reports whether candidate is strictly better than current
+// under the hierarchical objective every acceptance/comparison decision in
+// this file uses: fewer vehicles wins outright; a tie on vehicles falls
+// through to total distance.
+func isBetterSolution(candidate, current Solution) bool {
+	if candidate.TotalVehicles != current.TotalVehicles {
+		return candidate.TotalVehicles < current.TotalVehicles
 	}
+	return candidate.TotalDistance < current.TotalDistance
+}
+
+// destroyOperatorNames enumerates every destroy operator the main LNS loop
+// chooses among, in weight-vector order. Index into this slice is the index
+// into every alnsWeights slice below - the two must stay in lockstep.
+var destroyOperatorNames = []string{"Route Elimination", "Worst Destroy", "Random Destroy", "Shaw Destroy"}
+
+// ALNS adaptive-weight tuning constants (Ropke & Pisinger, 2006's
+// "adaptive weight adjustment" scheme, with constants chosen for this
+// instance size rather than reproducing any specific paper's exact values):
+//   - alnsSegmentLength: iterations between weight updates. Long enough
+//     that a slow operator (e.g. Route Elimination, which can take multiple
+//     seconds per call - see eliminateOneRoute) gets a fair number of tries
+//     before being judged, short enough that the mix actually adapts within
+//     a typical -iterations budget.
+//   - alnsReactionFactor: how much a segment's observed performance moves
+//     the running weight vs. how much of the old weight persists - low
+//     values are slow-and-stable, high values chase noise.
+//   - alnsReward{NewBest,Improved,Accepted}: what an operator earns for
+//     this iteration's outcome, in decreasing order of desirability. Purely
+//     relative to each other, not absolute - only the ratio matters.
+//   - alnsMinWeight: floor so one bad segment can't zero an operator out
+//     permanently; it can still occasionally be tried and earn its way back.
+const (
+	alnsSegmentLength  = 50
+	alnsReactionFactor = 0.2
+	alnsRewardNewBest  = 15.0
+	alnsRewardImproved = 5.0
+	alnsRewardAccepted = 1.0
+	alnsMinWeight      = 0.1
+)
+
+// alnsWeights tracks per-destroy-operator roulette-wheel weights and the
+// current segment's accumulated score/usage. Operators are chosen
+// proportional to weight (choose), credited for their outcome each
+// iteration (reward), and periodically reweighted by how well they've
+// performed relative to how often they were tried (updateSegment) - the
+// mix shifts toward whatever's actually productive on THIS instance,
+// instead of a fixed guess baked in ahead of time.
+type alnsWeights struct {
+	weight       []float64
+	segmentScore []float64
+	segmentUsage []int
+}
+
+func newALNSWeights(n int) *alnsWeights {
+	w := make([]float64, n)
+	for i := range w {
+		w[i] = 1.0
+	}
+	return &alnsWeights{
+		weight:       w,
+		segmentScore: make([]float64, n),
+		segmentUsage: make([]int, n),
+	}
+}
+
+// choose picks an operator index via roulette-wheel selection over the
+// current weights. roll is expected uniform in [0, 1) - passed in rather
+// than sampled internally so this method is deterministic and unit
+// testable without touching the global RNG.
+func (a *alnsWeights) choose(roll float64) int {
+	total := 0.0
+	for _, w := range a.weight {
+		total += w
+	}
+	if total <= 0 {
+		return 0
+	}
+	target := roll * total
+	cum := 0.0
+	for i, w := range a.weight {
+		cum += w
+		if target < cum {
+			return i
+		}
+	}
+	return len(a.weight) - 1
+}
+
+// reward credits opIdx's segment score for this iteration's outcome. Call
+// with one of the alnsReward* constants, or don't call at all for a
+// rejected candidate (worth 0, same effect as not calling but this also
+// avoids counting rejections toward segmentUsage's average).
+func (a *alnsWeights) reward(opIdx int, score float64) {
+	a.segmentScore[opIdx] += score
+	a.segmentUsage[opIdx]++
+}
+
+// updateSegment applies the reaction-factor-weighted rolling update to
+// every operator's weight from its accumulated segment score/usage, then
+// resets the segment accumulators for the next window. An operator not
+// used at all this segment keeps its existing weight unchanged - only a
+// fired-but-unproductive operator loses weight, never an unlucky one that
+// simply didn't get picked.
+func (a *alnsWeights) updateSegment(reactionFactor float64) {
+	for i := range a.weight {
+		if a.segmentUsage[i] > 0 {
+			avg := a.segmentScore[i] / float64(a.segmentUsage[i])
+			a.weight[i] = a.weight[i]*(1-reactionFactor) + reactionFactor*avg
+			if a.weight[i] < alnsMinWeight {
+				a.weight[i] = alnsMinWeight
+			}
+		}
+		a.segmentScore[i] = 0
+		a.segmentUsage[i] = 0
+	}
+}
+
+// Simulated-annealing acceptance constants. Vehicle count stays strictly
+// hierarchical regardless of temperature - SA only ever decides whether to
+// accept a WORSE-DISTANCE candidate that ties the current solution's
+// vehicle count; a candidate using more vehicles is always rejected
+// outright, no matter how hot the schedule is. Temperature is geometric
+// cooling relative to the constructed solution's total distance, so the
+// schedule scales sensibly across instances of very different sizes/units
+// rather than needing a per-instance absolute constant:
+//   - saInitialTempFraction: starting temperature as a fraction of the
+//     post-construction solution's total distance.
+//   - saFinalTempFraction: ending temperature as a fraction of the
+//     initial temperature - by the last iteration the schedule has cooled
+//     to almost-greedy.
+const (
+	saInitialTempFraction = 0.05
+	saFinalTempFraction   = 0.01
+)
+
+// simulatedAnnealingAccept applies the standard Metropolis criterion for a
+// worse candidate: accept with probability exp(-delta/temperature). delta
+// must be the (positive) amount worse the candidate is; callers only call
+// this once a strict improvement has already been ruled out. roll is
+// expected uniform in [0, 1) - passed in rather than sampled internally so
+// this is deterministic and unit-testable without touching the global RNG.
+func simulatedAnnealingAccept(delta, temperature, roll float64) bool {
+	if temperature <= 0 {
+		return false
+	}
+	probability := math.Exp(-delta / temperature)
+	return roll < probability
 }
 
 func main() {
 	filePath := flag.String("file", "", "Path to the Solomon instance file")
 	iterations := flag.Int("iterations", 1000, "Number of LNS iterations")
 	seed := flag.Int64("seed", 42, "Random seed")
-	llmThreshold := flag.Int("llm-threshold", 20, "Iteration threshold for stagnation intervention")
+	stagnationThreshold := flag.Int("stagnation-threshold", 20, "Iteration threshold for stagnation intervention")
 	useLKH := flag.Bool("use-lkh", false, "Use the native LKH3 binary instead of the pure-Go I1+LNS sub-solver for stagnation sub-solving")
+	restarts := flag.Int("restarts", 1, "Number of independent sequential solves to run (seed, seed+1, ..., seed+restarts-1), keeping the best result across all of them. Native CLI use only - the browser worker always passes 1, so this has no effect on the running web app.")
 	flag.Parse()
 
 	if *filePath == "" {
 		sendError("File path is required")
 		return
 	}
-
-	rand.Seed(*seed)
+	if *restarts < 1 {
+		*restarts = 1
+	}
 
 	startTime := time.Now()
 
@@ -107,342 +244,405 @@ func main() {
 	}
 	customerMap[depot.ID] = depot
 
-	// 2. Build Initial Feasible Solution
-	sol := buildInitialSolution(customers, depot, capacity, customerMap)
-	if len(sol.Routes) == 0 {
-		sendError("Failed to build a feasible initial solution")
-		return
-	}
-
-	// 2a. Tighten the raw I1 construction with 2-opt/Or-opt before anything
-	// else touches it - route-elimination attempts below succeed more often
-	// against routes that aren't carrying distance/time slack the insertion
-	// heuristic left behind.
-	sol = localSearchImprove(sol, customerMap, depot, capacity)
-
-	// 2b. Vehicle-minimization pre-phase: while the solution is still loose
-	// (freshly constructed, not yet distance-optimized), aggressively try
-	// to eliminate routes before the main distance-focused loop starts. See
-	// docs/superpowers/specs/2026-07-27-route-elimination-operator-design.md.
-	prePhaseBudget := int(0.10 * float64(*iterations))
-	sol = runVehicleMinimizationPrePhase(sol, customerMap, depot, capacity, prePhaseBudget, startTime)
-	sol = localSearchImprove(sol, customerMap, depot, capacity)
-
-	// Send initial progress
-	sendProgress(0, sol, startTime)
-
-	bestSol := cloneSolution(sol)
-
-	// Determine destroy sizes
-	numCustomers := len(customers)
-	minDestroy := int(math.Max(2, float64(numCustomers)*0.05))
-	maxDestroy := int(math.Max(5, float64(numCustomers)*0.30))
-
-	// Stagnation and adaptive LLM intervention tracking
-	stagnationCounter := 0
-
-	// 3. Solver Loop (LNS)
-	for iter := 1; iter <= *iterations; iter++ {
-		currentSol := cloneSolution(sol)
-
-		// Decide how many customers to destroy
-		k := rand.Intn(maxDestroy-minDestroy+1) + minDestroy
-
-		// 1. Destroy + 2. Repair
-		destroyType := chooseDestroyOperator(rand.Float64())
-		var candidateSol Solution
-
-		if destroyType == "Route Elimination" {
-			eliminated, ok := tryRouteElimination(currentSol, customerMap, depot, capacity, 3)
-			sendProgressLog(iter, bestSol, startTime, "LNS:CHOOSE", "Neighborhood '%s' attempted (success=%v)", destroyType, ok)
-			if ok {
-				candidateSol = eliminated
-			} else {
-				candidateSol = currentSol
-			}
-		} else {
-			var removed []int
-			var partialSol Solution
-			if destroyType == "Worst Destroy" {
-				partialSol, removed = destroyWorst(currentSol, k, customerMap, depot)
-			} else {
-				partialSol, removed = destroyRandom(currentSol, k, customerMap, depot)
-			}
-			sendProgressLog(iter, bestSol, startTime, "LNS:CHOOSE", "Neighborhood '%s' selected to remove %d customers: %v", destroyType, k, removed)
-			candidateSol = repairGreedy(partialSol, removed, customerMap, depot, capacity)
-			// Tighten every repaired candidate before it's judged for
-			// acceptance - greedy insertion alone routinely leaves crossing
-			// edges and out-of-order visits that 2-opt/Or-opt can remove for
-			// free (Route Elimination's candidate is already tightened
-			// inside tryRouteElimination itself).
-			candidateSol = localSearchImprove(candidateSol, customerMap, depot, capacity)
+	// Sequential multi-start: run the whole construction+LNS pipeline once
+	// per restart with a different seed, keeping the best result across all
+	// of them (isBetterSolution, the same hierarchical vehicles-then-distance
+	// comparison the main loop itself uses to accept candidates). restarts=1
+	// (the default, and the only value the browser worker ever passes) makes
+	// this loop run exactly once with no behavior change from before.
+	var overallBest Solution
+	for restart := 0; restart < *restarts; restart++ {
+		restartSeed := *seed + int64(restart)
+		rand.Seed(restartSeed)
+		if *restarts > 1 {
+			sendStart(fmt.Sprintf("Restart %d/%d (seed=%d)", restart+1, *restarts, restartSeed))
 		}
 
-		// 3. Evaluate & Decide (Acceptance criterion)
-		accept := false
-		acceptReason := "candidate worse than current"
-
-		if candidateSol.TotalVehicles < sol.TotalVehicles {
-			accept = true
-			acceptReason = "reduced fleet size"
-		} else if candidateSol.TotalVehicles == sol.TotalVehicles && candidateSol.TotalDistance < sol.TotalDistance {
-			accept = true
-			acceptReason = "reduced route distance"
+		// 2. Build Initial Feasible Solution
+		sol := buildInitialSolution(customers, depot, capacity, customerMap)
+		if len(sol.Routes) == 0 {
+			sendError("Failed to build a feasible initial solution")
+			return
 		}
 
-		if !accept && destroyType == "Random Destroy" {
-			accept = true
-			acceptReason = "always accept Random Destroy to escape local optima"
+		// 2a. Tighten the raw I1 construction with 2-opt/Or-opt before anything
+		// else touches it - route-elimination attempts below succeed more often
+		// against routes that aren't carrying distance/time slack the insertion
+		// heuristic left behind.
+		sol = localSearchImprove(sol, customerMap, depot, capacity)
+
+		// 2b. Vehicle-minimization pre-phase: while the solution is still loose
+		// (freshly constructed, not yet distance-optimized), aggressively try
+		// to eliminate routes before the main distance-focused loop starts. See
+		// docs/superpowers/specs/2026-07-27-route-elimination-operator-design.md.
+		prePhaseBudget := int(0.10 * float64(*iterations))
+		sol = runVehicleMinimizationPrePhase(sol, customerMap, depot, capacity, prePhaseBudget, startTime)
+		sol = localSearchImprove(sol, customerMap, depot, capacity)
+
+		// Send initial progress
+		sendProgress(0, sol, startTime)
+
+		bestSol := cloneSolution(sol)
+
+		// Determine destroy sizes
+		numCustomers := len(customers)
+		minDestroy := int(math.Max(2, float64(numCustomers)*0.05))
+		maxDestroy := int(math.Max(5, float64(numCustomers)*0.30))
+
+		// Stagnation and adaptive LLM intervention tracking
+		stagnationCounter := 0
+
+		// ALNS adaptive destroy-operator weights - see alnsWeights for the
+		// selection/reward/reweighting scheme.
+		weights := newALNSWeights(len(destroyOperatorNames))
+
+		// Simulated-annealing temperature schedule - see simulatedAnnealingAccept.
+		temperature := saInitialTempFraction * sol.TotalDistance
+		finalTemperature := temperature * saFinalTempFraction
+		coolingRate := 1.0
+		if *iterations > 0 && temperature > 0 {
+			coolingRate = math.Pow(finalTemperature/temperature, 1.0/float64(*iterations))
 		}
 
-		improvedThisIter := false
-		if accept {
-			sol = candidateSol
-			// Check if it is the absolute best found so far
-			if sol.TotalVehicles < bestSol.TotalVehicles || (sol.TotalVehicles == bestSol.TotalVehicles && sol.TotalDistance < bestSol.TotalDistance) {
-				improvedThisIter = true
-				bestSol = cloneSolution(sol)
-				sendProgressLog(iter, bestSol, startTime, "LNS:DECISION", "[NEW BEST] Found better global solution: %d vehicles, %.2f distance (Reason: %s)!", bestSol.TotalVehicles, bestSol.TotalDistance, acceptReason)
-			} else {
-				sendProgressLog(iter, bestSol, startTime, "LNS:ACCEPT", "[ACCEPTED] Candidate accepted: %d vehicles, %.2f distance (Reason: %s)", sol.TotalVehicles, sol.TotalDistance, acceptReason)
-			}
-		} else {
-			sendProgressLog(iter, bestSol, startTime, "LNS:REJECT", "[REJECTED] Candidate rejected: %d vehicles, %.2f distance vs current %.2f (Reason: %s)", candidateSol.TotalVehicles, candidateSol.TotalDistance, sol.TotalDistance, acceptReason)
-		}
+		// 3. Solver Loop (LNS)
+		for iter := 1; iter <= *iterations; iter++ {
+			currentSol := cloneSolution(sol)
 
-		if improvedThisIter {
-			stagnationCounter = 0
-		} else {
-			stagnationCounter++
-		}
+			// Decide how many customers to destroy
+			k := rand.Intn(maxDestroy-minDestroy+1) + minDestroy
 
-		// Smart Heuristic stagnation-solver intervention when we are stuck (stagnated for *llmThreshold iterations)
-		triggerHeuristic := shouldTriggerStagnationSolver(stagnationCounter, *llmThreshold, *iterations)
+			// 1. Destroy + 2. Repair
+			opIdx := weights.choose(rand.Float64())
+			destroyType := destroyOperatorNames[opIdx]
+			var candidateSol Solution
 
-		if triggerHeuristic {
-			stagnationCounter = 0 // Reset stagnation counter since we are invoking heuristic now
-			
-			var history []DestructionAttempt
-			improved := false
-			maxAttempts := 3
-			originalBestSol := cloneSolution(bestSol)
-
-			for attempt := 1; attempt <= maxAttempts; attempt++ {
-				// Kept at a fixed 2-3 routes across all attempts (no escalation to
-				// 4-5) to keep subproblem sizes manageable for the LKH3 sub-solver.
-				minDestroyRoutes := 2
-				maxDestroyRoutes := 3
-
-				// Cap destruction sizes by actual number of routes
-				numRoutes := len(bestSol.Routes)
-				if minDestroyRoutes > numRoutes {
-					minDestroyRoutes = numRoutes
-				}
-				if maxDestroyRoutes > numRoutes {
-					maxDestroyRoutes = numRoutes
-				}
-				if minDestroyRoutes < 1 {
-					minDestroyRoutes = 1
-				}
-				if maxDestroyRoutes < minDestroyRoutes {
-					maxDestroyRoutes = minDestroyRoutes
-				}
-
-				triggerCategory := "HEURISTIC:TRIGGER"
-				if attempt > 1 {
-					sendProgressLog(iter, bestSol, startTime, triggerCategory, "Stagnation solver Attempt %d: Retrying with alternate seed routes (%d-%d routes).", attempt, minDestroyRoutes, maxDestroyRoutes)
+			switch destroyType {
+			case "Route Elimination":
+				eliminated, ok := tryRouteElimination(currentSol, customerMap, depot, capacity, 3)
+				sendProgressLog(iter, bestSol, startTime, "LNS:CHOOSE", "Neighborhood '%s' attempted (success=%v)", destroyType, ok)
+				if ok {
+					candidateSol = eliminated
 				} else {
-					sendProgressLog(iter, bestSol, startTime, triggerCategory, "Stagnation detected (stagnated for %d iters). Invoking Smart Heuristic routing analyzer (suggesting %d-%d routes to destroy).", stagnationCounter, minDestroyRoutes, maxDestroyRoutes)
+					candidateSol = currentSol
 				}
+			default:
+				var removed []int
+				var partialSol Solution
+				switch destroyType {
+				case "Worst Destroy":
+					partialSol, removed = destroyWorst(currentSol, k, customerMap, depot)
+				case "Shaw Destroy":
+					partialSol, removed = destroyShaw(currentSol, k, customerMap, depot)
+				default: // "Random Destroy"
+					partialSol, removed = destroyRandom(currentSol, k, customerMap, depot)
+				}
+				sendProgressLog(iter, bestSol, startTime, "LNS:CHOOSE", "Neighborhood '%s' selected to remove %d customers: %v", destroyType, k, removed)
+				candidateSol = repairGreedy(partialSol, removed, customerMap, depot, capacity)
+				// Tighten every repaired candidate before it's judged for
+				// acceptance - greedy insertion alone routinely leaves crossing
+				// edges and out-of-order visits that 2-opt/Or-opt can remove for
+				// free (Route Elimination's candidate is already tightened
+				// inside tryRouteElimination itself).
+				candidateSol = localSearchImprove(candidateSol, customerMap, depot, capacity)
+			}
 
-				decisionCategory := "HEURISTIC:DECISION"
-				finalDestroyIDs := selectStagnationRoutesHeuristically(bestSol, history, minDestroyRoutes, maxDestroyRoutes, customerMap, attempt)
-				
-				if len(finalDestroyIDs) > 0 {
-					// Collect customer IDs of destroyed routes to add to history if it fails
-					var destroyedCustIDs []int
-					for _, r := range bestSol.Routes {
+			// 3. Evaluate & Decide (Acceptance criterion)
+			accept := false
+			acceptReason := "candidate worse than current"
+			objectiveImprovement := false
+
+			if candidateSol.TotalVehicles < sol.TotalVehicles {
+				accept = true
+				objectiveImprovement = true
+				acceptReason = "reduced fleet size"
+			} else if candidateSol.TotalVehicles == sol.TotalVehicles && candidateSol.TotalDistance < sol.TotalDistance {
+				accept = true
+				objectiveImprovement = true
+				acceptReason = "reduced route distance"
+			}
+
+			// Simulated annealing only ever applies within a tied vehicle count -
+			// a candidate using MORE vehicles is rejected outright regardless of
+			// temperature, keeping the hierarchical objective intact. This
+			// replaces the old "always accept Random Destroy" diversification
+			// rule with a principled, cooling-schedule-driven one that applies
+			// uniformly across every destroy operator, not just one of them.
+			if !accept && candidateSol.TotalVehicles == sol.TotalVehicles {
+				delta := candidateSol.TotalDistance - sol.TotalDistance
+				if delta > 0 && simulatedAnnealingAccept(delta, temperature, rand.Float64()) {
+					accept = true
+					acceptReason = fmt.Sprintf("simulated annealing accept (delta=%.2f, T=%.2f)", delta, temperature)
+				}
+			}
+			temperature *= coolingRate
+
+			improvedThisIter := false
+			if accept {
+				sol = candidateSol
+				// Check if it is the absolute best found so far
+				if sol.TotalVehicles < bestSol.TotalVehicles || (sol.TotalVehicles == bestSol.TotalVehicles && sol.TotalDistance < bestSol.TotalDistance) {
+					improvedThisIter = true
+					bestSol = cloneSolution(sol)
+					sendProgressLog(iter, bestSol, startTime, "LNS:DECISION", "[NEW BEST] Found better global solution: %d vehicles, %.2f distance (Reason: %s)!", bestSol.TotalVehicles, bestSol.TotalDistance, acceptReason)
+				} else {
+					sendProgressLog(iter, bestSol, startTime, "LNS:ACCEPT", "[ACCEPTED] Candidate accepted: %d vehicles, %.2f distance (Reason: %s)", sol.TotalVehicles, sol.TotalDistance, acceptReason)
+				}
+			} else {
+				sendProgressLog(iter, bestSol, startTime, "LNS:REJECT", "[REJECTED] Candidate rejected: %d vehicles, %.2f distance vs current %.2f (Reason: %s)", candidateSol.TotalVehicles, candidateSol.TotalDistance, sol.TotalDistance, acceptReason)
+			}
+
+			// Credit this iteration's chosen operator per the ALNS scheme (see
+			// alnsWeights) and reweight every alnsSegmentLength iterations.
+			switch {
+			case improvedThisIter:
+				weights.reward(opIdx, alnsRewardNewBest)
+			case objectiveImprovement:
+				weights.reward(opIdx, alnsRewardImproved)
+			case accept:
+				weights.reward(opIdx, alnsRewardAccepted)
+			}
+			if iter%alnsSegmentLength == 0 {
+				weights.updateSegment(alnsReactionFactor)
+			}
+
+			if improvedThisIter {
+				stagnationCounter = 0
+			} else {
+				stagnationCounter++
+			}
+
+			// Smart Heuristic stagnation-solver intervention when we are stuck (stagnated for *stagnationThreshold iterations)
+			triggerHeuristic := shouldTriggerStagnationSolver(stagnationCounter, *stagnationThreshold, *iterations)
+
+			if triggerHeuristic {
+				stagnationCounter = 0 // Reset stagnation counter since we are invoking heuristic now
+
+				var history []DestructionAttempt
+				improved := false
+				maxAttempts := 3
+				originalBestSol := cloneSolution(bestSol)
+
+				for attempt := 1; attempt <= maxAttempts; attempt++ {
+					// Kept at a fixed 2-3 routes across all attempts (no escalation to
+					// 4-5) to keep subproblem sizes manageable for the LKH3 sub-solver.
+					minDestroyRoutes := 2
+					maxDestroyRoutes := 3
+
+					// Cap destruction sizes by actual number of routes
+					numRoutes := len(bestSol.Routes)
+					if minDestroyRoutes > numRoutes {
+						minDestroyRoutes = numRoutes
+					}
+					if maxDestroyRoutes > numRoutes {
+						maxDestroyRoutes = numRoutes
+					}
+					if minDestroyRoutes < 1 {
+						minDestroyRoutes = 1
+					}
+					if maxDestroyRoutes < minDestroyRoutes {
+						maxDestroyRoutes = minDestroyRoutes
+					}
+
+					triggerCategory := "HEURISTIC:TRIGGER"
+					if attempt > 1 {
+						sendProgressLog(iter, bestSol, startTime, triggerCategory, "Stagnation solver Attempt %d: Retrying with alternate seed routes (%d-%d routes).", attempt, minDestroyRoutes, maxDestroyRoutes)
+					} else {
+						sendProgressLog(iter, bestSol, startTime, triggerCategory, "Stagnation detected (stagnated for %d iters). Invoking Smart Heuristic routing analyzer (suggesting %d-%d routes to destroy).", stagnationCounter, minDestroyRoutes, maxDestroyRoutes)
+					}
+
+					decisionCategory := "HEURISTIC:DECISION"
+					finalDestroyIDs := selectStagnationRoutesHeuristically(bestSol, history, minDestroyRoutes, maxDestroyRoutes, customerMap, attempt)
+
+					if len(finalDestroyIDs) > 0 {
+						// Collect customer IDs of destroyed routes to add to history if it fails
+						var destroyedCustIDs []int
+						for _, r := range bestSol.Routes {
+							for _, id := range finalDestroyIDs {
+								if r.VehicleID == id {
+									destroyedCustIDs = append(destroyedCustIDs, r.CustomerIDs...)
+								}
+							}
+						}
+
+						sendProgressLog(iter, bestSol, startTime, decisionCategory, "Selected overlapping/inefficient vehicles %v for destruction (containing %d Customers %v).", finalDestroyIDs, len(destroyedCustIDs), destroyedCustIDs)
+
+						// Identify untouched routes vs destroyed routes
+						var untouchedRoutes []Route
+						var destroyedCustomers []Customer
+						destroyIDMap := make(map[int]bool)
 						for _, id := range finalDestroyIDs {
-							if r.VehicleID == id {
-								destroyedCustIDs = append(destroyedCustIDs, r.CustomerIDs...)
-							}
+							destroyIDMap[id] = true
 						}
-					}
-					
-					sendProgressLog(iter, bestSol, startTime, decisionCategory, "Selected overlapping/inefficient vehicles %v for destruction (containing %d Customers %v).", finalDestroyIDs, len(destroyedCustIDs), destroyedCustIDs)
-					
-					// Identify untouched routes vs destroyed routes
-					var untouchedRoutes []Route
-					var destroyedCustomers []Customer
-					destroyIDMap := make(map[int]bool)
-					for _, id := range finalDestroyIDs {
-						destroyIDMap[id] = true
-					}
-					
-					for _, r := range bestSol.Routes {
-						if destroyIDMap[r.VehicleID] {
-							// Add all customers in this route to destroyedCustomers
-							for _, cID := range r.CustomerIDs {
-								if c, exists := customerMap[cID]; exists {
-									destroyedCustomers = append(destroyedCustomers, c)
+
+						for _, r := range bestSol.Routes {
+							if destroyIDMap[r.VehicleID] {
+								// Add all customers in this route to destroyedCustomers
+								for _, cID := range r.CustomerIDs {
+									if c, exists := customerMap[cID]; exists {
+										destroyedCustomers = append(destroyedCustomers, c)
+									}
 								}
-							}
-						} else {
-							untouchedRoutes = append(untouchedRoutes, r)
-						}
-					}
-					
-					if len(destroyedCustomers) > 0 {
-						var subSol Solution
-						lkhHandled := false
-
-						if *useLKH {
-							lkhStart := time.Now()
-							var lkhSol *Solution
-
-							if probeVehicles, probeOK := shouldProbeLKHMinusOne(attempt, len(finalDestroyIDs)); probeOK {
-								sendProgressLog(iter, bestSol, startTime, "LKH:PROBE", "Attempt %d: probing whether %d vehicles suffice for %d removed customers (down from %d)...", attempt, probeVehicles, len(destroyedCustomers), len(finalDestroyIDs))
-								lkhSol = invokeLKHSubSolver(destroyedCustomers, depot, capacity, customerMap, probeVehicles)
-								if lkhSol != nil {
-									sendProgressLog(iter, bestSol, startTime, "LKH:PROBE-SUCCESS", "Probe succeeded: %d vehicles sufficient (reduced from %d) - skipping the %d-vehicle fallback.", probeVehicles, len(finalDestroyIDs), len(finalDestroyIDs))
-								} else {
-									sendProgressLog(iter, bestSol, startTime, "LKH:PROBE-FAILED", "Probe failed: %d vehicles not sufficient - falling back to %d.", probeVehicles, len(finalDestroyIDs))
-								}
-							}
-
-							if lkhSol == nil {
-								sendProgressLog(iter, bestSol, startTime, "LKH:TRIGGER", "Attempt %d: Invoking LKH3 on %d removed customers (vehicles cap = %d, no timeout)...", attempt, len(destroyedCustomers), len(finalDestroyIDs))
-								lkhSol = invokeLKHSubSolver(destroyedCustomers, depot, capacity, customerMap, len(finalDestroyIDs))
-							}
-							lkhElapsed := time.Since(lkhStart)
-
-							if lkhSol != nil {
-								subSol = *lkhSol
-								lkhHandled = true
-								sendProgressLog(iter, bestSol, startTime, "LKH:SUCCESS", "LKH3 sub-solve used (size=%d customers): %d vehicles, %.2f distance, took %v.", len(destroyedCustomers), subSol.TotalVehicles, subSol.TotalDistance, lkhElapsed)
 							} else {
-								sendProgressLog(iter, bestSol, startTime, "LKH:FALLBACK", "LKH3 sub-solve failed or returned an infeasible result (size=%d customers, took %v); falling back to the pure-Go sub-solver.", len(destroyedCustomers), lkhElapsed)
+								untouchedRoutes = append(untouchedRoutes, r)
 							}
 						}
 
-						if !lkhHandled {
-							sendProgressLog(iter, bestSol, startTime, "HEURISTIC:SUB-SOLVER", "Attempt %d: Re-routing %d removed customers. Phase 1: Solomon I1 Sequential Insertion...", attempt, len(destroyedCustomers))
+						if len(destroyedCustomers) > 0 {
+							var subSol Solution
+							lkhHandled := false
 
-							// Re-solve with our approach: I1 insertion -> LNS (run on the subset)
-							subSol = buildInitialSolution(destroyedCustomers, depot, capacity, customerMap)
-							sendProgressLog(iter, bestSol, startTime, "HEURISTIC:SUB-SOLVER", "Phase 1 Complete. Initial subproblem routing: %d vehicles, %.2f distance.", subSol.TotalVehicles, subSol.TotalDistance)
+							if *useLKH {
+								lkhStart := time.Now()
+								var lkhSol *Solution
 
-							if len(subSol.Routes) > 0 {
-								numSubCust := len(destroyedCustomers)
-								minSubDestroy := int(math.Max(1, float64(numSubCust)*0.10))
-								maxSubDestroy := int(math.Max(2, float64(numSubCust)*0.40))
-								if maxSubDestroy < minSubDestroy {
-									maxSubDestroy = minSubDestroy
-								}
-
-								sendProgressLog(iter, bestSol, startTime, "HEURISTIC:SUB-SOLVER", "Phase 2: Optimizing subproblem routing using LNS on subset for 50 sub-iterations (destroying %d-%d customers per sub-iter)...", minSubDestroy, maxSubDestroy)
-								// Run LNS on this sub-solution for 50 sub-iterations
-								subImprovements := 0
-								for subIter := 1; subIter <= 50; subIter++ {
-									currentSubSol := cloneSolution(subSol)
-									subK := minSubDestroy
-									if maxSubDestroy > minSubDestroy {
-										subK = rand.Intn(maxSubDestroy-minSubDestroy+1) + minSubDestroy
-									}
-
-									var subRemoved []int
-									var partialSubSol Solution
-									if rand.Float64() < 0.5 {
-										partialSubSol, subRemoved = destroyWorst(currentSubSol, subK, customerMap, depot)
+								if probeVehicles, probeOK := shouldProbeLKHMinusOne(attempt, len(finalDestroyIDs)); probeOK {
+									sendProgressLog(iter, bestSol, startTime, "LKH:PROBE", "Attempt %d: probing whether %d vehicles suffice for %d removed customers (down from %d)...", attempt, probeVehicles, len(destroyedCustomers), len(finalDestroyIDs))
+									lkhSol = invokeLKHSubSolver(destroyedCustomers, depot, capacity, customerMap, probeVehicles)
+									if lkhSol != nil {
+										sendProgressLog(iter, bestSol, startTime, "LKH:PROBE-SUCCESS", "Probe succeeded: %d vehicles sufficient (reduced from %d) - skipping the %d-vehicle fallback.", probeVehicles, len(finalDestroyIDs), len(finalDestroyIDs))
 									} else {
-										partialSubSol, subRemoved = destroyRandom(currentSubSol, subK, customerMap, depot)
-									}
-
-									candidateSubSol := repairGreedy(partialSubSol, subRemoved, customerMap, depot, capacity)
-
-									acceptSub := false
-									if candidateSubSol.TotalVehicles < subSol.TotalVehicles {
-										acceptSub = true
-									} else if candidateSubSol.TotalVehicles == subSol.TotalVehicles && candidateSubSol.TotalDistance < subSol.TotalDistance {
-										acceptSub = true
-									}
-
-									if acceptSub {
-										subSol = candidateSubSol
-										subImprovements++
+										sendProgressLog(iter, bestSol, startTime, "LKH:PROBE-FAILED", "Probe failed: %d vehicles not sufficient - falling back to %d.", probeVehicles, len(finalDestroyIDs))
 									}
 								}
-								sendProgressLog(iter, bestSol, startTime, "HEURISTIC:SUB-SOLVER", "Phase 2 Complete. Subset LNS performed %d improvements. Final subset routing: %d vehicles, %.2f distance.", subImprovements, subSol.TotalVehicles, subSol.TotalDistance)
+
+								if lkhSol == nil {
+									sendProgressLog(iter, bestSol, startTime, "LKH:TRIGGER", "Attempt %d: Invoking LKH3 on %d removed customers (vehicles cap = %d, no timeout)...", attempt, len(destroyedCustomers), len(finalDestroyIDs))
+									lkhSol = invokeLKHSubSolver(destroyedCustomers, depot, capacity, customerMap, len(finalDestroyIDs))
+								}
+								lkhElapsed := time.Since(lkhStart)
+
+								if lkhSol != nil {
+									subSol = *lkhSol
+									lkhHandled = true
+									sendProgressLog(iter, bestSol, startTime, "LKH:SUCCESS", "LKH3 sub-solve used (size=%d customers): %d vehicles, %.2f distance, took %v.", len(destroyedCustomers), subSol.TotalVehicles, subSol.TotalDistance, lkhElapsed)
+								} else {
+									sendProgressLog(iter, bestSol, startTime, "LKH:FALLBACK", "LKH3 sub-solve failed or returned an infeasible result (size=%d customers, took %v); falling back to the pure-Go sub-solver.", len(destroyedCustomers), lkhElapsed)
+								}
 							}
 
-							// subSol came out of buildInitialSolution + destroy/repair, neither
-							// of which does any intra/inter-route tightening - polish it before
-							// merging back into the full solution. Skipped for an LKH-sourced
-							// subSol (lkhHandled) since LKH already searches this far more
-							// thoroughly than a 2-opt/Or-opt pass over its output would add.
 							if !lkhHandled {
-								subSol = localSearchImprove(subSol, customerMap, depot, capacity)
+								sendProgressLog(iter, bestSol, startTime, "HEURISTIC:SUB-SOLVER", "Attempt %d: Re-routing %d removed customers. Phase 1: Solomon I1 Sequential Insertion...", attempt, len(destroyedCustomers))
+
+								// Re-solve with our approach: I1 insertion -> LNS (run on the subset)
+								subSol = buildInitialSolution(destroyedCustomers, depot, capacity, customerMap)
+								sendProgressLog(iter, bestSol, startTime, "HEURISTIC:SUB-SOLVER", "Phase 1 Complete. Initial subproblem routing: %d vehicles, %.2f distance.", subSol.TotalVehicles, subSol.TotalDistance)
+
+								if len(subSol.Routes) > 0 {
+									numSubCust := len(destroyedCustomers)
+									minSubDestroy := int(math.Max(1, float64(numSubCust)*0.10))
+									maxSubDestroy := int(math.Max(2, float64(numSubCust)*0.40))
+									if maxSubDestroy < minSubDestroy {
+										maxSubDestroy = minSubDestroy
+									}
+
+									sendProgressLog(iter, bestSol, startTime, "HEURISTIC:SUB-SOLVER", "Phase 2: Optimizing subproblem routing using LNS on subset for 50 sub-iterations (destroying %d-%d customers per sub-iter)...", minSubDestroy, maxSubDestroy)
+									// Run LNS on this sub-solution for 50 sub-iterations
+									subImprovements := 0
+									for subIter := 1; subIter <= 50; subIter++ {
+										currentSubSol := cloneSolution(subSol)
+										subK := minSubDestroy
+										if maxSubDestroy > minSubDestroy {
+											subK = rand.Intn(maxSubDestroy-minSubDestroy+1) + minSubDestroy
+										}
+
+										var subRemoved []int
+										var partialSubSol Solution
+										if rand.Float64() < 0.5 {
+											partialSubSol, subRemoved = destroyWorst(currentSubSol, subK, customerMap, depot)
+										} else {
+											partialSubSol, subRemoved = destroyRandom(currentSubSol, subK, customerMap, depot)
+										}
+
+										candidateSubSol := repairGreedy(partialSubSol, subRemoved, customerMap, depot, capacity)
+
+										acceptSub := false
+										if candidateSubSol.TotalVehicles < subSol.TotalVehicles {
+											acceptSub = true
+										} else if candidateSubSol.TotalVehicles == subSol.TotalVehicles && candidateSubSol.TotalDistance < subSol.TotalDistance {
+											acceptSub = true
+										}
+
+										if acceptSub {
+											subSol = candidateSubSol
+											subImprovements++
+										}
+									}
+									sendProgressLog(iter, bestSol, startTime, "HEURISTIC:SUB-SOLVER", "Phase 2 Complete. Subset LNS performed %d improvements. Final subset routing: %d vehicles, %.2f distance.", subImprovements, subSol.TotalVehicles, subSol.TotalDistance)
+								}
+
+								// subSol came out of buildInitialSolution + destroy/repair, neither
+								// of which does any intra/inter-route tightening - polish it before
+								// merging back into the full solution. Skipped for an LKH-sourced
+								// subSol (lkhHandled) since LKH already searches this far more
+								// thoroughly than a 2-opt/Or-opt pass over its output would add.
+								if !lkhHandled {
+									subSol = localSearchImprove(subSol, customerMap, depot, capacity)
+								}
+							}
+
+							// Merge back
+							var mergedRoutes []Route
+							for _, r := range untouchedRoutes {
+								mergedRoutes = append(mergedRoutes, r)
+							}
+							for _, r := range subSol.Routes {
+								mergedRoutes = append(mergedRoutes, r)
+							}
+
+							// Re-index vehicle IDs
+							for idx := range mergedRoutes {
+								mergedRoutes[idx].VehicleID = idx + 1
+							}
+
+							mergedSol := Solution{Routes: mergedRoutes}
+							recalculateSolutionMetrics(&mergedSol)
+
+							sendProgressLog(iter, bestSol, startTime, "HEURISTIC:MERGE", "Merged subproblem routes back. Merged full candidate: %d vehicles, %.2f distance.", mergedSol.TotalVehicles, mergedSol.TotalDistance)
+
+							// Check if this improved the pre-heuristic best solution
+							if mergedSol.TotalVehicles < originalBestSol.TotalVehicles || (mergedSol.TotalVehicles == originalBestSol.TotalVehicles && mergedSol.TotalDistance < originalBestSol.TotalDistance) {
+								// Successfully improved!
+								sol = mergedSol
+								bestSol = cloneSolution(mergedSol)
+								improved = true
+								sendProgressLog(iter, bestSol, startTime, "HEURISTIC:SUCCESS", "[SUCCESS] Attempt %d successfully improved solution! New best: %d vehicles, %.2f distance. Resuming global LNS.", attempt, bestSol.TotalVehicles, bestSol.TotalDistance)
+								break
+							} else {
+								// Did not improve! Log and add to history, then retry
+								sendProgressLog(iter, bestSol, startTime, "HEURISTIC:FAILURE", "[FAILED] Attempt %d did not improve upon best known solution (%.2f). Retrying...", attempt, originalBestSol.TotalDistance)
+								history = append(history, DestructionAttempt{
+									VehicleIDs: finalDestroyIDs,
+								})
 							}
 						}
-
-						// Merge back
-						var mergedRoutes []Route
-						for _, r := range untouchedRoutes {
-							mergedRoutes = append(mergedRoutes, r)
-						}
-						for _, r := range subSol.Routes {
-							mergedRoutes = append(mergedRoutes, r)
-						}
-						
-						// Re-index vehicle IDs
-						for idx := range mergedRoutes {
-							mergedRoutes[idx].VehicleID = idx + 1
-						}
-						
-						mergedSol := Solution{Routes: mergedRoutes}
-						recalculateSolutionMetrics(&mergedSol)
-						
-						sendProgressLog(iter, bestSol, startTime, "HEURISTIC:MERGE", "Merged subproblem routes back. Merged full candidate: %d vehicles, %.2f distance.", mergedSol.TotalVehicles, mergedSol.TotalDistance)
-						
-						// Check if this improved the pre-heuristic best solution
-						if mergedSol.TotalVehicles < originalBestSol.TotalVehicles || (mergedSol.TotalVehicles == originalBestSol.TotalVehicles && mergedSol.TotalDistance < originalBestSol.TotalDistance) {
-							// Successfully improved!
-							sol = mergedSol
-							bestSol = cloneSolution(mergedSol)
-							improved = true
-							sendProgressLog(iter, bestSol, startTime, "HEURISTIC:SUCCESS", "[SUCCESS] Attempt %d successfully improved solution! New best: %d vehicles, %.2f distance. Resuming global LNS.", attempt, bestSol.TotalVehicles, bestSol.TotalDistance)
-							break
-						} else {
-							// Did not improve! Log and add to history, then retry
-							sendProgressLog(iter, bestSol, startTime, "HEURISTIC:FAILURE", "[FAILED] Attempt %d did not improve upon best known solution (%.2f). Retrying...", attempt, originalBestSol.TotalDistance)
-							history = append(history, DestructionAttempt{
-								VehicleIDs: finalDestroyIDs,
-							})
-						}
+					} else {
+						sendProgressLog(iter, bestSol, startTime, "HEURISTIC:FAILURE", "[FAILED] Attempt %d generated no valid vehicles. Retrying...", attempt)
+						history = append(history, DestructionAttempt{
+							VehicleIDs: finalDestroyIDs,
+						})
 					}
-				} else {
-					sendProgressLog(iter, bestSol, startTime, "HEURISTIC:FAILURE", "[FAILED] Attempt %d generated no valid vehicles. Retrying...", attempt)
-					history = append(history, DestructionAttempt{
-						VehicleIDs: finalDestroyIDs,
-					})
+				}
+
+				if !improved {
+					sendProgressLog(iter, bestSol, startTime, "HEURISTIC:FAILURE", "All %d heuristic attempts completed without improvement. Reverting to original best (%.2f) and resuming global LNS...", maxAttempts, originalBestSol.TotalDistance)
+					sol = cloneSolution(originalBestSol)
+					bestSol = cloneSolution(originalBestSol)
 				}
 			}
 
-			if !improved {
-				sendProgressLog(iter, bestSol, startTime, "HEURISTIC:FAILURE", "All %d heuristic attempts completed without improvement. Reverting to original best (%.2f) and resuming global LNS...", maxAttempts, originalBestSol.TotalDistance)
-				sol = cloneSolution(originalBestSol)
-				bestSol = cloneSolution(originalBestSol)
+			// Send progress updates
+			if iter%50 == 0 || iter == 1 || iter == *iterations {
+				sendProgress(iter, bestSol, startTime)
 			}
 		}
 
-		// Send progress updates
-		if iter%50 == 0 || iter == 1 || iter == *iterations {
-			sendProgress(iter, bestSol, startTime)
+		if restart == 0 || isBetterSolution(bestSol, overallBest) {
+			overallBest = cloneSolution(bestSol)
 		}
 	}
 
-	// Send final results
-	sendResult(bestSol, startTime, *iterations)
+	// Send final results (the best across every restart)
+	sendResult(overallBest, startTime, *iterations)
 }
 
 // Distance helper
@@ -558,7 +758,7 @@ func parseSolomonFile(path string) (string, int, float64, Customer, []Customer, 
 // among all unrouted customers' best insertion points for the CURRENT
 // route, which one to actually insert. Fixed constants, not CLI flags,
 // consistent with this file's existing style for internal tuning knobs
-// (e.g. chooseDestroyOperator's 20/40/40 split).
+// (e.g. the ALNS reward/reaction-factor constants near alnsWeights).
 const (
 	i1Mu     = 1.0 // route-shape weight in c11 = d(i,u) + d(u,j) - mu*d(i,j)
 	i1Alpha1 = 0.5 // weight on the distance term c11 within c1
@@ -977,6 +1177,196 @@ func destroyRandom(sol Solution, k int, customers map[int]Customer, depot Custom
 
 		if len(activeIDs) > 0 {
 			// Calculate precise route details with real customer coords
+			rDetails, _ := calculateRouteDetails(activeIDs, customers, depot, 1e9)
+			rDetails.VehicleID = r.VehicleID
+			newRoutes = append(newRoutes, rDetails)
+		}
+	}
+
+	partialSol := Solution{Routes: newRoutes}
+	recalculateSolutionMetrics(&partialSol)
+	return partialSol, removed
+}
+
+// relatednessParams bundles the per-solution normalization denominators used
+// by customerRelatedness, so distance/time/demand - three totally different
+// units - can be combined into one comparable score. Computed once per
+// destroyShaw call via computeRelatednessContext, not per customer pair.
+type relatednessParams struct {
+	maxDist       float64
+	maxTimeDiff   float64
+	maxDemandDiff float64
+}
+
+// customerRelatedness scores how "related" two customers are for Shaw-style
+// removal (Shaw, 1997; the weighted three-term combination is the
+// formulation used by Ropke & Pisinger's ALNS papers). Lower means more
+// related - more attractive to remove together, since a repair pass is more
+// likely to be able to re-cluster related customers back onto a single
+// route than an arbitrary pair. Combines:
+//   - geographic distance (dominant term, weight 9)
+//   - difference in arrival time *in the current solution* (weight 3) - not
+//     the raw time-window bounds, since two customers with overlapping wide
+//     windows but very different actual visit times in this solution aren't
+//     really "related" the way Shaw removal means it
+//   - demand difference (weight 2)
+//
+// All three terms are normalized to [0,1] by the instance-wide maximums in
+// params before weighting, so no single unit (meters vs. minutes vs. demand
+// units) dominates just because of scale.
+func customerRelatedness(a, b Customer, arrivalA, arrivalB float64, params relatednessParams) float64 {
+	const (
+		distWeight   = 9.0
+		timeWeight   = 3.0
+		demandWeight = 2.0
+	)
+
+	d := distance(a, b)
+	if params.maxDist > 0 {
+		d /= params.maxDist
+	}
+
+	t := math.Abs(arrivalA - arrivalB)
+	if params.maxTimeDiff > 0 {
+		t /= params.maxTimeDiff
+	}
+
+	q := math.Abs(a.Demand - b.Demand)
+	if params.maxDemandDiff > 0 {
+		q /= params.maxDemandDiff
+	}
+
+	return distWeight*d + timeWeight*t + demandWeight*q
+}
+
+// computeRelatednessContext extracts each routed customer's arrival time in
+// the CURRENT solution (from Route.ArrivalTimes, populated by
+// calculateRouteDetails) and the instance-wide max distance/time-diff/
+// demand-diff needed to normalize customerRelatedness. O(n^2) over routed
+// customers, trivial at Solomon/Homberger's 100-customer scale.
+func computeRelatednessContext(sol Solution, customers map[int]Customer) (map[int]float64, relatednessParams) {
+	arrival := make(map[int]float64)
+	for _, r := range sol.Routes {
+		for cID, t := range r.ArrivalTimes {
+			arrival[cID] = t
+		}
+	}
+
+	ids := make([]int, 0, len(arrival))
+	for id := range arrival {
+		ids = append(ids, id)
+	}
+	sort.Ints(ids)
+
+	var params relatednessParams
+	for i := 0; i < len(ids); i++ {
+		a := customers[ids[i]]
+		for j := i + 1; j < len(ids); j++ {
+			b := customers[ids[j]]
+			if d := distance(a, b); d > params.maxDist {
+				params.maxDist = d
+			}
+			if t := math.Abs(arrival[ids[i]] - arrival[ids[j]]); t > params.maxTimeDiff {
+				params.maxTimeDiff = t
+			}
+			if q := math.Abs(a.Demand - b.Demand); q > params.maxDemandDiff {
+				params.maxDemandDiff = q
+			}
+		}
+	}
+
+	return arrival, params
+}
+
+// shawRandomization is the "determinism parameter" from the Shaw-removal
+// literature: candidate selection draws y = rand()^shawRandomization and
+// picks the relatedness-sorted candidate at index floor(y * len(candidates)),
+// so higher values bias harder toward the single most-related candidate
+// while still leaving room for a less-related pick. 6 sits in the middle of
+// the 3-8 range commonly used in the ALNS literature.
+const shawRandomization = 6.0
+
+// destroyShaw implements Shaw (relatedness-based) removal: unlike
+// Worst/Random removal, which have no notion of which removed customers
+// belong together, this grows a removal set by repeatedly picking - from a
+// randomly chosen already-removed "anchor" - the most related still-routed
+// customer (customerRelatedness), randomized by shawRandomization rather
+// than picked purely greedily. The intent is a removal set a repair pass can
+// plausibly re-cluster onto a single route, which is exactly the kind of
+// structural move Worst/Random removal can't reliably produce.
+func destroyShaw(sol Solution, k int, customers map[int]Customer, depot Customer) (Solution, []int) {
+	arrival, params := computeRelatednessContext(sol, customers)
+
+	routedIDs := make([]int, 0, len(arrival))
+	for id := range arrival {
+		routedIDs = append(routedIDs, id)
+	}
+	sort.Ints(routedIDs)
+
+	if len(routedIDs) == 0 {
+		return sol, nil
+	}
+	if k > len(routedIDs) {
+		k = len(routedIDs)
+	}
+	if k < 1 {
+		k = 1
+	}
+
+	remaining := make(map[int]bool, len(routedIDs))
+	for _, id := range routedIDs {
+		remaining[id] = true
+	}
+
+	seed := routedIDs[rand.Intn(len(routedIDs))]
+	removed := []int{seed}
+	delete(remaining, seed)
+
+	for len(removed) < k {
+		anchorID := removed[rand.Intn(len(removed))]
+		anchor := customers[anchorID]
+		anchorArrival := arrival[anchorID]
+
+		candidates := make([]int, 0, len(remaining))
+		for id := range remaining {
+			candidates = append(candidates, id)
+		}
+		if len(candidates) == 0 {
+			break
+		}
+		sort.Ints(candidates) // deterministic pre-sort order before scoring
+
+		sort.Slice(candidates, func(i, j int) bool {
+			ri := customerRelatedness(anchor, customers[candidates[i]], anchorArrival, arrival[candidates[i]], params)
+			rj := customerRelatedness(anchor, customers[candidates[j]], anchorArrival, arrival[candidates[j]], params)
+			return ri < rj
+		})
+
+		y := math.Pow(rand.Float64(), shawRandomization)
+		idx := int(y * float64(len(candidates)))
+		if idx >= len(candidates) {
+			idx = len(candidates) - 1
+		}
+
+		picked := candidates[idx]
+		removed = append(removed, picked)
+		delete(remaining, picked)
+	}
+
+	removedSet := make(map[int]bool, len(removed))
+	for _, id := range removed {
+		removedSet[id] = true
+	}
+
+	var newRoutes []Route
+	for _, r := range sol.Routes {
+		var activeIDs []int
+		for _, cID := range r.CustomerIDs {
+			if !removedSet[cID] {
+				activeIDs = append(activeIDs, cID)
+			}
+		}
+		if len(activeIDs) > 0 {
 			rDetails, _ := calculateRouteDetails(activeIDs, customers, depot, 1e9)
 			rDetails.VehicleID = r.VehicleID
 			newRoutes = append(newRoutes, rDetails)
@@ -1610,6 +2000,129 @@ type DestructionAttempt struct {
 	VehicleIDs []int `json:"vehicleIds"`
 }
 
+// routeCentroid summarizes one route's geography, timing, and load for
+// route-level relatedness scoring: geographic centroid, average per-customer
+// route distance, average per-customer arrival time (in the CURRENT
+// solution), average per-customer demand, total load, and its index into
+// the Solution.Routes slice it was computed from.
+type routeCentroid struct {
+	RouteID    int
+	CentroidX  float64
+	CentroidY  float64
+	AvgDist    float64
+	AvgArrival float64
+	AvgDemand  float64
+	Load       float64
+	RouteIdx   int
+}
+
+// routeCentroidsFor computes a routeCentroid for every route in sol.
+func routeCentroidsFor(sol Solution, customerMap map[int]Customer) []routeCentroid {
+	centroids := make([]routeCentroid, len(sol.Routes))
+	for idx, r := range sol.Routes {
+		sumX := 0.0
+		sumY := 0.0
+		sumArrival := 0.0
+		sumDemand := 0.0
+		cnt := 0
+		for _, cID := range r.CustomerIDs {
+			if c, exists := customerMap[cID]; exists {
+				sumX += c.X
+				sumY += c.Y
+				sumDemand += c.Demand
+				sumArrival += r.ArrivalTimes[cID]
+				cnt++
+			}
+		}
+		avgX := 0.0
+		avgY := 0.0
+		avgArrival := 0.0
+		avgDemand := 0.0
+		avgDist := r.Distance
+		if cnt > 0 {
+			avgX = sumX / float64(cnt)
+			avgY = sumY / float64(cnt)
+			avgArrival = sumArrival / float64(cnt)
+			avgDemand = sumDemand / float64(cnt)
+			avgDist = r.Distance / float64(cnt)
+		}
+		centroids[idx] = routeCentroid{
+			RouteID:    r.VehicleID,
+			CentroidX:  avgX,
+			CentroidY:  avgY,
+			AvgDist:    avgDist,
+			AvgArrival: avgArrival,
+			AvgDemand:  avgDemand,
+			Load:       r.Load,
+			RouteIdx:   idx,
+		}
+	}
+	return centroids
+}
+
+// routeAsCustomer treats a route as a single synthetic "customer" at its
+// centroid, with the route's average per-customer demand standing in for a
+// single customer's demand - the adapter that lets route-level relatedness
+// reuse customerRelatedness (built for Shaw removal) unchanged.
+func routeAsCustomer(c routeCentroid) Customer {
+	return Customer{X: c.CentroidX, Y: c.CentroidY, Demand: c.AvgDemand}
+}
+
+// routeRelatednessParams computes the normalization denominators
+// customerRelatedness needs, from the full set of route centroids.
+func routeRelatednessParams(centroids []routeCentroid) relatednessParams {
+	var params relatednessParams
+	for i := 0; i < len(centroids); i++ {
+		for j := i + 1; j < len(centroids); j++ {
+			a, b := routeAsCustomer(centroids[i]), routeAsCustomer(centroids[j])
+			if d := distance(a, b); d > params.maxDist {
+				params.maxDist = d
+			}
+			if t := math.Abs(centroids[i].AvgArrival - centroids[j].AvgArrival); t > params.maxTimeDiff {
+				params.maxTimeDiff = t
+			}
+			if q := math.Abs(centroids[i].AvgDemand - centroids[j].AvgDemand); q > params.maxDemandDiff {
+				params.maxDemandDiff = q
+			}
+		}
+	}
+	return params
+}
+
+// mostRelatedRoutes returns the seed route's ID followed by the count-1
+// most-related other routes' IDs (ascending by customerRelatedness, i.e.
+// most related first), reusing the same relatedness measure Shaw removal
+// uses at the customer level. Route-level relatedness (rather than pure
+// centroid distance) means two routes that overlap in space but serve very
+// different parts of the working day, or wildly different demand profiles,
+// are treated as less related than pure geographic distance alone would
+// suggest - the property this replaced a plain nearest-centroid sort to get.
+func mostRelatedRoutes(centroids []routeCentroid, params relatednessParams, seedIdx int, count int) []int {
+	seed := centroids[seedIdx]
+	seedCust := routeAsCustomer(seed)
+	type ScoredID struct {
+		RouteID int
+		Score   float64
+	}
+	var list []ScoredID
+	for idx, other := range centroids {
+		if idx == seedIdx {
+			continue
+		}
+		score := customerRelatedness(seedCust, routeAsCustomer(other), seed.AvgArrival, other.AvgArrival, params)
+		list = append(list, ScoredID{RouteID: other.RouteID, Score: score})
+	}
+	sort.Slice(list, func(i, j int) bool {
+		return list[i].Score < list[j].Score
+	})
+
+	res := []int{seed.RouteID}
+	for i := 0; i < count-1 && i < len(list); i++ {
+		res = append(res, list[i].RouteID)
+	}
+	return res
+}
+
 func selectStagnationRoutesHeuristically(
 	bestSol Solution,
 	history []DestructionAttempt,
@@ -1631,73 +2144,10 @@ func selectStagnationRoutesHeuristically(
 		countToDestroy = 1
 	}
 
-	// Calculate centroid and metrics for each route
-	type RouteCentroid struct {
-		RouteID   int
-		CentroidX float64
-		CentroidY float64
-		AvgDist   float64
-		Load      float64
-		RouteIdx  int
-	}
-
-	centroids := make([]RouteCentroid, numRoutes)
-	for idx, r := range bestSol.Routes {
-		sumX := 0.0
-		sumY := 0.0
-		cnt := 0
-		for _, cID := range r.CustomerIDs {
-			if c, exists := customerMap[cID]; exists {
-				sumX += c.X
-				sumY += c.Y
-				cnt++
-			}
-		}
-		avgX := 0.0
-		avgY := 0.0
-		avgDist := r.Distance
-		if cnt > 0 {
-			avgX = sumX / float64(cnt)
-			avgY = sumY / float64(cnt)
-			avgDist = r.Distance / float64(cnt)
-		}
-		centroids[idx] = RouteCentroid{
-			RouteID:   r.VehicleID,
-			CentroidX: avgX,
-			CentroidY: avgY,
-			AvgDist:   avgDist,
-			Load:      r.Load,
-			RouteIdx:  idx,
-		}
-	}
-
-	// Helper to find the closest routes to a given seed route
+	centroids := routeCentroidsFor(bestSol, customerMap)
+	relParams := routeRelatednessParams(centroids)
 	getClosestRoutes := func(seedIdx int, count int) []int {
-		seed := centroids[seedIdx]
-		type DistWithID struct {
-			RouteID int
-			Dist    float64
-		}
-		var list []DistWithID
-		for idx, other := range centroids {
-			if idx == seedIdx {
-				continue
-			}
-			dx := seed.CentroidX - other.CentroidX
-			dy := seed.CentroidY - other.CentroidY
-			dist := math.Sqrt(dx*dx + dy*dy)
-			list = append(list, DistWithID{RouteID: other.RouteID, Dist: dist})
-		}
-		// Sort list by distance ascending (closest centroids)
-		sort.Slice(list, func(i, j int) bool {
-			return list[i].Dist < list[j].Dist
-		})
-
-		res := []int{seed.RouteID}
-		for i := 0; i < count-1 && i < len(list); i++ {
-			res = append(res, list[i].RouteID)
-		}
-		return res
+		return mostRelatedRoutes(centroids, relParams, seedIdx, count)
 	}
 
 	isAlreadyAttempted := func(ids []int) bool {

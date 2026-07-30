@@ -192,6 +192,10 @@ rc201 in this file's history were wrong (rc201's was actually rc103's value).
 
 ## Solver algorithm (Go path, `solver/main.go` — the one the web app runs, via WASM)
 
+**[README.md](README.md) is the full algorithmic writeup** (aimed at an OR audience, with
+diagrams) - this section is just an engineering-oriented index into it, plus the flag/build
+details README.md doesn't cover.
+
 - **Initial solution**: Solomon I1 sequential insertion (`buildInitialSolution`) — one route at a
   time from the full unrouted pool, seeded by farthest-from-depot, filled by c1 (distance +
   time-window shift) / c2 (depot-distance regret) selection. No clustering pre-step.
@@ -200,25 +204,31 @@ rc201 in this file's history were wrong (rc201's was actually rc103's value).
   Budgeted at 10% of `-iterations`, logged under the `VEHICLE-MIN` category. See
   `docs/superpowers/specs/2026-07-27-route-elimination-operator-design.md` for why this runs
   up front rather than only reactively.
-- **Destroy operators**: worst-distance and random removal (`destroyWorst`/`destroyRandom`), plus
-  Route Elimination (`destroyRouteElimination` + `repairGreedyNoNewRoute`, orchestrated by
-  `tryRouteElimination`) - fired 20% of the time in the main loop (vs. 40%/40% for
-  Worst/Random; see `chooseDestroyOperator`). Route Elimination exists because the other two
-  operators can't reliably reduce vehicle count on their own.
+- **Destroy operators**: four - Route Elimination, Worst Destroy, Random Destroy, and Shaw
+  (relatedness-based) Destroy - chosen each iteration by ALNS adaptive roulette-wheel weighting
+  (`alnsWeights`), not a fixed split. Weights start equal and are reweighted every 50 iterations
+  from each operator's average reward that segment (new-best > tied-vehicle improvement >
+  accepted-but-worse > nothing for a reject). See README.md's "Destroy operators" section for the
+  full mechanics and Shaw removal's relatedness formula.
 - **Repair**: greedy insertion (`repairGreedy`); Route Elimination uses
   `repairGreedyNoNewRoute` instead (reinsertion into existing routes only, never opens a new
   one).
-- **Acceptance**: always accept on reduced fleet size or distance; random destroys always accepted
-  to keep exploring.
-- **Stagnation intervention**: after `-llm-threshold` iterations with no improvement, destroys
-  2–5 routes and re-solves the freed customers, escalating destroy size across up to 3 attempts if
-  it doesn't improve. Route re-solving is either the pure-Go heuristic
-  (`selectStagnationRoutesHeuristically`, default) or LKH3 (`invokeLKHSubSolver`) depending on
-  `-use-lkh` — see above. (Despite the flag's name, `-llm-threshold` is just the stagnation
-  iteration count; it predates the LKH3 work and hasn't been renamed.)
-- There is no solver-side early-stop feature - the loop always runs the full `-iterations` count.
-  The UI's best-known-solution comparison (see "Problem data") is purely a post-hoc display, not
-  a stopping condition sent to the solver.
+- **Acceptance**: always accept on reduced fleet size or distance; within a tied vehicle count, a
+  worse-distance candidate is accepted via a simulated-annealing Metropolis criterion
+  (`simulatedAnnealingAccept`) with a geometrically-cooling temperature schedule - never applies
+  across a worse vehicle count, so the hierarchical objective can't be relaxed by temperature.
+- **Stagnation intervention**: after `-stagnation-threshold` iterations with no improvement,
+  destroys 2–5 routes (selected by route-level relatedness - `selectStagnationRoutesHeuristically`
+  → `mostRelatedRoutes`, reusing the same `customerRelatedness` scoring Shaw removal uses) and
+  re-solves the freed customers, escalating destroy size across up to 3 attempts if it doesn't
+  improve. Route re-solving is either the pure-Go heuristic (default) or LKH3
+  (`invokeLKHSubSolver`) depending on `-use-lkh` — see above.
+- **Multi-start**: `-restarts N` (native CLI only, default 1, browser worker never passes anything
+  else) runs N full independent solves sequentially with seed, seed+1, ..., keeping the best
+  (`isBetterSolution`) as the final result.
+- There is no solver-side early-stop feature - the loop always runs the full `-iterations` count
+  (× `-restarts`, if set above 1). The UI's best-known-solution comparison (see "Problem data") is
+  purely a post-hoc display, not a stopping condition sent to the solver.
 
 ## API surface (`server.ts`) — there is none anymore
 

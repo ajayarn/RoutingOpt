@@ -145,24 +145,27 @@ pre-phase just runs it up front, unconditionally, before distance optimization n
 
 ```mermaid
 flowchart TD
-    Start([Current solution]) --> Choose{Pick destroy<br/>operator}
-    Choose -- 20% --> RE[Route Elimination]
-    Choose -- 40% --> WD["Worst Destroy<br/>(remove k customers,<br/>noised removal-cost ranking)"]
-    Choose -- 40% --> RD["Random Destroy<br/>(remove k customers<br/>uniformly)"]
+    Start([Current solution]) --> Choose["ALNS roulette-wheel pick<br/>(weighted, adapts every 50 iters)"]
+    Choose --> RE[Route Elimination]
+    Choose --> WD["Worst Destroy<br/>(remove k customers,<br/>noised removal-cost ranking)"]
+    Choose --> RD["Random Destroy<br/>(remove k customers<br/>uniformly)"]
+    Choose --> SD["Shaw Destroy<br/>(remove k related customers)"]
 
     RE --> ReRepair["repairGreedyNoNewRoute<br/>(reinsert, no new route)"]
     WD --> Repair["repairGreedy<br/>(reinsert, new route allowed)"]
     RD --> Repair
+    SD --> Repair
 
     ReRepair --> Polish2["localSearchImprove<br/>(2-opt + Or-opt)"]
     Repair --> Polish2
 
     Polish2 --> Accept{Accept?}
     Accept -- "fewer vehicles,<br/>OR same vehicles + shorter" --> Keep[Candidate becomes current]
-    Accept -- "worse, but destroy<br/>type = Random" --> Keep
+    Accept -- "same vehicles, worse distance:<br/>simulated annealing roll" --> Keep
     Accept -- otherwise --> Reject[Discard candidate]
 
-    Keep --> Best{New global best?}
+    Keep --> Reward["Credit the chosen operator's<br/>ALNS segment score"]
+    Reward --> Best{New global best?}
     Best -- yes --> UpdateBest[Update best solution<br/>reset stagnation counter]
     Best -- no --> Continue[Continue]
     Reject --> IncStag[Increment stagnation counter]
@@ -172,17 +175,38 @@ flowchart TD
     IncStag --> Next
 ```
 
-Each iteration: destroy → repair → local-search polish → accept/reject → check stagnation.
-`k` (customers removed per iteration, for Worst/Random) is drawn uniformly from
-`[max(2, 5% of customers), max(5, 30% of customers)]` each iteration.
+Each iteration: pick a destroy operator → destroy → repair → local-search polish → accept/reject
+→ credit the operator → check stagnation. `k` (customers removed per iteration, for Worst/Random/
+Shaw) is drawn uniformly from `[max(2, 5% of customers), max(5, 30% of customers)]` each iteration.
 
-### Destroy operators (`chooseDestroyOperator`)
+### Destroy operators - adaptive (ALNS) selection
 
-| Operator | Probability | Mechanism |
-|---|---|---|
-| **Route Elimination** | 20% | Same primitive as the pre-phase — try to empty one whole weak route into the others. |
-| **Worst Destroy** | 40% | Remove the `k` customers whose removal saves the most route distance (`destroyWorst`), with random noise added to the ranking so it isn't perfectly greedy every time. |
-| **Random Destroy** | 40% | Remove `k` uniformly random customers (`destroyRandom`). |
+Rather than a fixed split, which operator fires each iteration is chosen by roulette wheel over
+weights that adapt to what's actually been productive on *this* instance (`alnsWeights`, following
+Ropke & Pisinger's adaptive large neighborhood search scheme): every operator starts at weight 1.0;
+each iteration's chosen operator is credited a score based on its outcome (new global best > tied-
+vehicle improvement > accepted-but-worse > nothing for a rejected candidate); every 50 iterations,
+weights are updated from each operator's average score that segment (`w = w·(1−r) + r·avgScore`,
+reaction factor `r = 0.2`), floored so a bad segment can't zero an operator out permanently. An
+operator that wasn't tried at all that segment keeps its weight unchanged - only firing-but-
+unproductive is penalized, never being unlucky enough not to get picked.
+
+| Operator | Mechanism |
+|---|---|
+| **Route Elimination** | Same primitive as the pre-phase — try to empty one whole weak route into the others. |
+| **Worst Destroy** | Remove the `k` customers whose removal saves the most route distance (`destroyWorst`), with random noise added to the ranking so it isn't perfectly greedy every time. |
+| **Random Destroy** | Remove `k` uniformly random customers (`destroyRandom`). |
+| **Shaw Destroy** | Remove a *related* cluster of `k` customers (`destroyShaw`) - see below. |
+
+**Shaw (relatedness-based) removal** (Shaw, 1997; the weighted-term formulation is Ropke &
+Pisinger's): grows a removal set by repeatedly picking, from a random already-removed "anchor"
+customer, the most-related still-routed customer, where relatedness (`customerRelatedness`)
+combines - each normalized to [0,1] by the instance-wide maximum, then weighted - geographic
+distance (weight 9, dominant), difference in *current-solution* arrival time (weight 3, not the
+raw time-window bounds), and demand difference (weight 2). Selection isn't purely greedy: a
+"determinism parameter" (`shawRandomization = 6`, `y = roll^6` biasing toward but not forcing the
+single most-related candidate) keeps it from being deterministic. The intent, unlike Worst/Random
+removal, is a removal set a repair pass can plausibly re-cluster onto one route.
 
 ### Repair
 
@@ -192,31 +216,31 @@ fits. Route Elimination candidates instead go through `repairGreedyNoNewRoute` (
 insertion, but a new route is never opened — that would defeat the point of trying to eliminate
 one).
 
-### Acceptance criterion
+### Acceptance criterion - simulated annealing, bounded by the hierarchical objective
 
-This is a **best-improvement-with-forced-diversification** rule, not a simulated-annealing /
-Metropolis criterion:
-
-- Always accept if the candidate uses **fewer vehicles**.
+- Always accept if the candidate uses **fewer vehicles** - this can never be overridden by
+  temperature; a worse-vehicle-count candidate is rejected outright regardless of how "hot" the
+  schedule is, keeping the hierarchical objective intact.
 - Otherwise accept if vehicle count is unchanged and **distance improved**.
-- Otherwise, **always accept anyway if the destroy operator was Random Destroy** — this is the
-  solver's sole mechanism for escaping local optima. (Worst Destroy and Route Elimination
-  candidates that don't improve are simply discarded.)
-
-There's no cooling schedule, no acceptance probability, no tabu list. See
-[Limitations](#known-limitations--places-to-improve) for what this trades away.
+- Otherwise, within a **tied vehicle count**, accept a worse-distance candidate with Metropolis
+  probability `exp(-Δ/T)` (`simulatedAnnealingAccept`), where `Δ` is how much worse the distance
+  is and `T` cools geometrically from `5%` of the constructed solution's total distance down to
+  `1%` of that starting value by the final iteration. This applies uniformly across every destroy
+  operator, not just one of them.
 
 ### Stagnation intervention
 
-If `stagnationCounter` (consecutive non-improving iterations) reaches `-llm-threshold` (default
-20; the flag name is a legacy misnomer, see below), a heavier intervention fires:
+If `stagnationCounter` (consecutive non-improving iterations) reaches `-stagnation-threshold`
+(default 20), a heavier intervention fires:
 
-1. **Select routes to destroy** (`selectStagnationRoutesHeuristically`): rather than a random or
-   worst-distance pick, this computes each route's geographic centroid and preferentially selects
-   *spatially overlapping* routes — the intuition being that overlapping routes are the most
-   likely to have an inefficient customer-to-vehicle assignment that a purely-local destroy/repair
-   pass would never untangle, because doing so requires moving many customers across two routes at
-   once.
+1. **Select routes to destroy** (`selectStagnationRoutesHeuristically` → `mostRelatedRoutes`):
+   rather than a random or worst-distance pick, this treats each route as a single synthetic
+   "customer" at its centroid (reusing `customerRelatedness`, the same scoring Shaw removal uses)
+   and preferentially selects the most *related* routes - not just geographically close ones, but
+   ones visited at similar times in the current solution and carrying similar demand. Two routes
+   that overlap in space but serve very different parts of the working day, or wildly different
+   loads, are now treated as less related than pure centroid distance alone would suggest - the
+   property this replaced a plain nearest-centroid sort to get.
 2. **Re-solve the freed customers as a subproblem**, via either:
    - the **pure-Go sub-solver** (default): I1 construction on just the destroyed customers, then
      50 sub-iterations of a small destroy/repair LNS on that subset, then a local-search polish; or
@@ -260,25 +284,36 @@ bolt a soft-penalty external solver (LKH3) onto an otherwise hard-constraint sys
 
 ## Results
 
-| Instance | Best known | This solver | Gap | Run condition |
-|---|---|---|---|---|
-| C101 (clustered, loose time windows) | 10 vehicles / 828.94 | 10 vehicles / 828.94 | 0.00% | `-iterations 50`, `-seed 1` — solves in ~1s, well under a minute |
-| R204 (random, wide time windows, 2-vehicle capacity-bound) | 2 vehicles / 825.52 | 2 vehicles / 862.86 | 4.52% | 10-minute wall-clock budget, `-use-lkh` on |
+Both instances below were run under identical conditions (`-iterations 2000`, `-seed 42`, no
+`-use-lkh`) so the comparison across rows is genuinely apples-to-apples, unlike an earlier version
+of this table that mixed a short C101 run with a long LKH-assisted R204 run:
 
-These two runs used very different budgets (a few dozen iterations vs. ten minutes), so don't read
-the gap column as an apples-to-apples comparison across rows — each instance's own row is real, the
-two rows aren't directly comparable to each other.
+| Instance | Best known | This solver | Gap |
+|---|---|---|---|
+| C101 (clustered, loose time windows) | 10 vehicles / 828.94 | 10 vehicles / 828.94 | 0.00% |
+| R204 (random, wide time windows, 2-vehicle capacity-bound) | 2 vehicles / 825.52 | 2 vehicles / 861.24 | 4.33% |
 
 The C101 number is not a hardcoded target: best-known values live only in the frontend's display
 table (`BEST_KNOWN_SOLUTIONS` in `src/App.tsx`) for showing the gap in the UI, and are never passed
-into the solver — there is no early-stop-at-optimal feature anywhere in `solver/main.go` (an
-earlier version of this codebase had one; it was removed and is not coming back via this repo's
-`-optimal` flag, which doesn't exist). C101's loose time windows and clustered layout make it a
-genuinely easy instance for I1 + LNS to reach optimality on — R204 (2-vehicle capacity bound, wide
-time windows) is a much harder search space, hence the visible gap. See
-[`R204_IMPROVEMENT_REPORT.md`](R204_IMPROVEMENT_REPORT.md) for a full session log of what was tried
-against it (this is exactly the kind of instance where a smarter destroy operator or a proper
-ALNS weight-learning scheme would likely help most — see below).
+into the solver — there is no early-stop-at-optimal feature anywhere in `solver/main.go`. C101's
+loose time windows and clustered layout make it a genuinely easy instance for I1 + LNS to reach
+optimality on — R204 (2-vehicle capacity bound, wide time windows) is a much harder search space,
+hence the visible gap. See [`R204_IMPROVEMENT_REPORT.md`](R204_IMPROVEMENT_REPORT.md) for a full
+session log from before this pass's algorithm changes.
+
+**Before/after this pass's algorithm changes** (Shaw removal, ALNS adaptive weighting, simulated
+annealing, relatedness-aware stagnation selection), same exact run condition:
+
+| Instance | Before | After | Change |
+|---|---|---|---|
+| C101 | 10 vehicles / 828.94 (33.0s) | 10 vehicles / 828.94 (27.9s) | no change (already optimal) |
+| R204 | 2 vehicles / 870.86 (601s) | 2 vehicles / 861.24 (454s) | **1.10% shorter distance, 24% faster** |
+
+R204 - the harder of the two instances in this repo's own testing - got measurably better *and*
+faster from the same iteration budget, which is the result these changes were made for: C101 was
+already solved, so there was nowhere for the new operators to show their value; R204's tighter
+capacity bound and wider time windows are exactly the kind of harder search space a relatedness-
+aware removal operator and an adaptive operator mix should help with most.
 
 Results were not run in this pass across the full 56-instance Solomon/Homberger set bundled in
 `public/data/` — that would be a natural next step for anyone forking this to benchmark
@@ -286,43 +321,33 @@ systematically.
 
 ## Known limitations / places to improve
 
-This is deliberately not a from-the-literature textbook ALNS implementation, and there are several
-places where a more principled approach would likely do better. Listed roughly in the order an OR
-practitioner would probably want to attack them:
+This is deliberately not a from-the-literature textbook ALNS implementation, and there are still
+several places where a more principled approach would likely do better. Listed roughly in the
+order an OR practitioner would probably want to attack them:
 
-- **No adaptive operator weighting.** The 20/40/40 destroy-operator split is a fixed constant, not
-  learned. A standard ALNS roulette-wheel weight update (reward operators that recently produced
-  improvements, decay weights over time) is the most obvious structural upgrade — the codebase
-  already logs enough per-iteration outcome data (`LNS:ACCEPT`/`LNS:REJECT`/`LNS:DECISION` in the
-  solver console) to bootstrap this.
-- **No principled acceptance criterion.** "Always accept Random Destroy, otherwise only accept
-  strict improvements" is a crude diversification mechanism. A simulated-annealing-style
-  Metropolis criterion (accept worse solutions with probability `exp(-Δ/T)`, cooling `T` over the
-  run) is standard LNS/ILS practice and isn't implemented here.
-- **No Shaw / relatedness-based removal.** Worst-distance and pure-random are the two removal
-  operators; there's no removal operator that targets *related* customers (by distance + time
-  window overlap + demand similarity — classic "Shaw removal"), which tends to create more
-  promising repair opportunities than either extreme.
-- **Stagnation route selection is a hand-tuned heuristic**, not derived from an established
-  removal criterion — it clusters by geographic centroid overlap. This works well enough to be
-  useful (see Results) but a Shaw-style relatedness measure incorporating time windows and demand,
-  not just geography, would likely generalize better across instance types (R1/RC1 series vs. C1).
-- **LKH3 WASM pool has a known intermittent bug** (documented in CLAUDE.md): an occasional
-  Emscripten runtime error from one sub-solve call can leave the module pool unable to refill for
-  the rest of a run, silently downgrading later stagnation interventions to the pure-Go sub-solver
-  for the remainder of that run. Feasibility is unaffected (nothing infeasible can leak through
-  regardless), but solve *quality* quietly degrades with no visible error. Root cause not yet
-  isolated — see CLAUDE.md's "Client-side execution" section.
-- **No parallelism or multi-start.** Single-threaded, single-trajectory LNS. Running several
-  independent trajectories (different seeds) and keeping the best, or parallelizing the
-  destroy/repair evaluation itself, isn't implemented.
+- **ALNS reward/reaction-factor constants are hand-picked, not tuned.** The segment length (50),
+  reaction factor (0.2), and reward ratios (15/5/1 for new-best/improved/accepted) are reasonable
+  defaults, not the result of any tuning sweep on this instance set - if the operator mix looks
+  wrong on a given instance (e.g. Shaw Destroy's weight collapsing to the floor early), this is the
+  first place to look.
+- **Shaw removal's relatedness weights (9/3/2 for distance/time/demand) are fixed**, following the
+  literature's typical distance-dominant ratio rather than being tuned per instance - R1/RC1
+  instances with tighter time windows might benefit from weighting the time term more heavily.
+- **LKH3 WASM pool exhaustion has a defensive mitigation, not a root-cause fix.** After 5
+  consecutive sub-solve failures/exhaustions, the pool is torn down and rebuilt from scratch rather
+  than being left permanently stuck - this bounds the damage (LKH keeps getting used again later in
+  the run instead of falling back to pure-Go for the rest of it) but the underlying intermittent
+  Emscripten-level failure that causes exhaustion in the first place is still unexplained. See
+  CLAUDE.md's "Client-side execution" section.
+- **Multi-start is sequential only, and native-CLI-only.** `-restarts N` runs N independent
+  trajectories (seed, seed+1, ...) one after another and keeps the best - useful for squeezing a
+  better answer out of a fixed wall-clock budget on the CLI, but it's not real parallelism (no
+  wall-clock speedup) and the browser worker never passes it. True parallel multi-start in the
+  browser would mean multiple Web Workers each running an independent WASM instance - architecturally
+  the same shape as the LKH pool, not a quick addition.
 - **Only Euclidean, static-instance VRPTW.** No support for asymmetric distances, multiple depots,
   heterogeneous fleets, or dynamic/online arrivals — matches the Solomon benchmark's scope, but is
   worth knowing if you're evaluating this against a different problem class.
-- **`-llm-threshold`** (stagnation iteration count) and the frontend's `logFilter: 'llm'` key are
-  both legacy misnomers from an earlier LLM-guided-destroy-operator design that was fully removed
-  from this codebase; kept as-is rather than renamed to avoid touching the CLI-argv/UI wiring for
-  a cosmetic change. `-use-lkh` is unrelated and still fully live.
 
 ## Running it locally
 
@@ -332,15 +357,19 @@ practitioner would probably want to attack them:
 ```
 
 Flags: `-file` (Solomon instance path, required), `-iterations` (LNS iteration budget, default
-1000), `-seed` (RNG seed, default 42), `-llm-threshold` (stagnation trigger threshold, default 20,
-`0` disables it), `-use-lkh` (enable the LKH3 sub-solver, default `false`, requires `lkh_bin` —
-see `./build_lkh.sh`). Output is one JSON object per line on stdout: `start`/`progress`/`result`/
-`error` messages, the same protocol the browser Web Worker consumes.
+1000), `-seed` (RNG seed, default 42), `-stagnation-threshold` (stagnation trigger threshold,
+default 20, `0` disables it), `-use-lkh` (enable the LKH3 sub-solver, default `false`, requires
+`lkh_bin` — see `./build_lkh.sh`), `-restarts` (native CLI only - run N independent sequential
+solves with seed, seed+1, ..., keeping the best; default 1, and the browser worker never passes
+anything else). Output is one JSON object per line on stdout: `start`/`progress`/`result`/`error`
+messages, the same protocol the browser Web Worker consumes.
 
 Go unit tests (`solver/*_test.go`) cover construction correctness (every customer routed exactly
 once, feasibility, determinism under a fixed seed), local search (never worsens, never drops
-customers), route elimination (vehicle-count reduction, no customer-ID aliasing bugs), and the
-stagnation/LKH decision helpers:
+customers), route elimination (vehicle-count reduction, no customer-ID aliasing bugs), the ALNS
+weight update mechanics, the Shaw-removal relatedness scoring (including a statistical check that
+it actually groups related customers far more often than chance), the simulated-annealing
+acceptance probability, and the stagnation/LKH decision helpers:
 
 ```bash
 cd solver && go test ./...
@@ -353,11 +382,12 @@ rc1/rc2 series) if you want to benchmark against something other than C101/R204.
 
 Forks and PRs welcome, especially ones that:
 
-- Replace the fixed destroy-operator weights with adaptive (ALNS-style) weighting
-- Add a Shaw/relatedness removal operator
-- Add a proper acceptance criterion (simulated annealing or similar) instead of the current
-  always-accept-on-random-destroy rule
-- Root-cause the LKH3 WASM pool exhaustion bug
+- Tune the ALNS segment length / reaction factor / reward ratios and the Shaw relatedness weights
+  against a real benchmark sweep, rather than the hand-picked defaults currently in place
+- Root-cause the LKH3 WASM pool exhaustion bug, rather than the current tear-down-and-recreate
+  mitigation
+- Add real parallel multi-start (multiple Web Workers in the browser; goroutines with independent
+  `*rand.Rand` instances natively)
 - Run and publish a full 56-instance benchmark comparison
 
 See [CLAUDE.md](CLAUDE.md) for the build/deploy pipeline (Go → WASM, LKH3 vendoring and its
