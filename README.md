@@ -6,9 +6,11 @@ Worker. No backend, no cloud inference — the whole optimization runs on whatev
 tab open.
 
 This document is for anyone with an operations-research background who wants to understand the
-algorithm, poke holes in it, or fork the repo and improve it. It describes the *solver design*,
-not the web app plumbing — see [CLAUDE.md](CLAUDE.md) for the engineering/architecture side (WASM
-build pipeline, Web Worker internals, LKH3 vendoring, deployment).
+algorithm, poke holes in it, or fork the repo and improve it. It describes the *solver design* -
+construction, local search, destroy/repair operators, acceptance criterion - not the surrounding
+web app plumbing in detail (the Go solver is compiled to WebAssembly and run in a browser Web
+Worker so the whole optimization happens client-side with no backend; see "Running it locally" and
+"Build & deploy" below for the mechanics if you're touching that layer).
 
 **Live demo:** https://ajayarn.github.io/RoutingOpt/ (deploys from `main`; this document describes
 the `result-improvement` branch, which only removes dead code and fixes non-algorithmic bugs on
@@ -267,8 +269,10 @@ If `stagnationCounter` (consecutive non-improving iterations) reaches `-stagnati
 
 `-use-lkh` swaps step 2 above for a call into [LKH3](http://webhotel4.ruc.dk/~keld/research/LKH-3/)
 — a specialized, decades-refined TSP/VRP local-search solver — compiled either as a native binary
-(CLI use) or to WebAssembly (browser use, via a small pool of pre-instantiated module instances;
-see CLAUDE.md's "Client-side execution" section for why a pool).
+(CLI use) or to WebAssembly (browser use, via a small pool of pre-instantiated module instances,
+not one shared instance - LKH's C globals are never reset between solve calls within a single
+module instance, so reusing one across sub-solve calls risks stale-state corruption from the
+previous call leaking into the next).
 
 Two things make this safe to bolt onto a hard-constraint solver even though **LKH3 internally uses
 a soft violation-penalty model, not hard constraints**:
@@ -358,8 +362,13 @@ order an OR practitioner would probably want to attack them:
   consecutive sub-solve failures/exhaustions, the pool is torn down and rebuilt from scratch rather
   than being left permanently stuck - this bounds the damage (LKH keeps getting used again later in
   the run instead of falling back to pure-Go for the rest of it) but the underlying intermittent
-  Emscripten-level failure that causes exhaustion in the first place is still unexplained. See
-  CLAUDE.md's "Client-side execution" section.
+  Emscripten-level failure that causes exhaustion in the first place is still unexplained. It's been
+  reproduced under an aggressive stagnation-threshold stress test (short threshold, LKH forced on,
+  many stagnation triggers in quick succession) but not isolated to a specific cause - candidates
+  include WASM linear-memory corruption or stale Emscripten virtual-filesystem state leaking across
+  calls despite the per-call module-instance pooling. Results stay correct either way (every LKH
+  route is re-validated - see "Feasibility" below), this only silently degrades solve *quality* by
+  losing the LKH boost for the rest of a run.
 - **Multi-start is sequential only, and native-CLI-only.** `-restarts N` runs N independent
   trajectories (seed, seed+1, ...) one after another and keeps the best - useful for squeezing a
   better answer out of a fixed wall-clock budget on the CLI, but it's not real parallelism (no
@@ -399,6 +408,41 @@ cd solver && go test ./...
 `public/data/` bundles all 56 Solomon/Homberger 100-customer benchmark instances (c1/c2/r1/r2/
 rc1/rc2 series) if you want to benchmark against something other than C101/R204.
 
+## Build & deploy
+
+The same `solver/main.go` is built two ways:
+
+```bash
+./build_solver.sh          # native CLI binary -> solver_bin, for standalone benchmarking
+./build_solver_wasm.sh     # GOOS=js GOARCH=wasm -> public/wasm/solver.wasm, for the browser
+```
+
+The browser build runs inside a classic (non-module) Web Worker (`public/solverWorker.js`), which
+loads `wasm_exec.js` (Go's WASM runtime glue) and the compiled `solver.wasm`, then provides two
+things a browser doesn't have natively that `main.go` relies on: a small in-memory virtual
+filesystem (`os.ReadFile` needs an `fs`-shaped object; Go's WASM runtime only stubs one that
+supports stdout) to hand it the instance text, and (if `-use-lkh` is set) the LKH bridge described
+above. `solver_bin`, `public/wasm/solver.wasm`, and its sibling files are committed to the repo
+directly rather than built in CI — rebuild and commit them by hand after any Go source change, or
+the deployed app silently keeps running the stale binary.
+
+**LKH3 itself** (`lkh3src/`, vendored C source, intentionally untracked - likely a licensing
+concern) compiles two ways, `./build_lkh.sh` (native, via its own unmodified `Makefile`) and
+`./build_lkh_wasm.sh` (Emscripten, needs a local `tools/emsdk/` install). The Emscripten build
+needs one non-obvious workaround: LKH3's headers declare ~130 global variables as old-C89-style
+tentative definitions with no `extern`, relying on the linker to merge same-named ones across
+translation units into one common symbol - which `wasm-ld` doesn't support (it errors as duplicate
+symbols). `lkh_wasm_prepare.py` (invoked by `build_lkh_wasm.sh`) stages patched copies of the
+affected headers with `extern` added, plus a generated file holding the one true definition of
+each, without touching the vendored source itself.
+
+**Deployment** is a fully static GitHub Pages site (https://ajayarn.github.io/RoutingOpt/) built by
+a GitHub Actions workflow on every push to `main` - `vite build` only, publishing `dist/` directly,
+no server component. Two things make a subpath deploy (not domain root) work without hardcoded
+paths: Vite's `base: './'` config (relative asset URLs), and every hand-written absolute path in
+the frontend/worker (`fetch('/data/...')`, `importScripts(...)`, `new Worker('/solverWorker.js')`)
+being relative instead - Vite doesn't rewrite plain string literals like these on its own.
+
 ## Contributing
 
 Forks and PRs welcome, especially ones that:
@@ -411,6 +455,6 @@ Forks and PRs welcome, especially ones that:
   `*rand.Rand` instances natively)
 - Run and publish a full 56-instance benchmark comparison
 
-See [CLAUDE.md](CLAUDE.md) for the build/deploy pipeline (Go → WASM, LKH3 vendoring and its
-Emscripten linking workaround, GitHub Pages deploy) if your change touches anything beyond
-`solver/main.go` itself.
+See "Build & deploy" above if your change touches anything beyond `solver/main.go` itself -
+rebuilding `public/wasm/solver.wasm` after a Go change is easy to forget and the browser will
+silently keep running the stale binary if you do.
