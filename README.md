@@ -12,11 +12,9 @@ web app plumbing in detail (the Go solver is compiled to WebAssembly and run in 
 Worker so the whole optimization happens client-side with no backend; see "Running it locally" and
 "Build & deploy" below for the mechanics if you're touching that layer).
 
-**Live demo:** https://ajayarn.github.io/RoutingOpt/ (deploys from `main`; this document describes
-the `result-improvement` branch, which only removes dead code and fixes non-algorithmic bugs on
-top of `main` — the LNS/construction/LKH3 logic itself is identical between the two, so the demo
-reflects everything described below regardless of merge status)
-**Solver source:** [`solver/main.go`](solver/main.go) (~2000 lines, single file, no external Go
+**Live demo:** https://ajayarn.github.io/RoutingOpt/ (deploys from `main` on every push; this
+document is kept current against `main`, so the demo reflects everything described below)
+**Solver source:** [`solver/main.go`](solver/main.go) (~2950 lines, single file, no external Go
 dependencies)
 
 ## Problem
@@ -48,7 +46,7 @@ re-validated (see [LKH3 sub-solver](#lkh3-sub-solver-optional)).
 ```mermaid
 flowchart TD
     A[Parse Solomon instance] --> B["Construction:<br/>Solomon I1 sequential insertion"]
-    B --> C["Local search polish<br/>(2-opt + Or-opt to convergence)"]
+    B --> C["Local search polish<br/>(2-opt + 2-opt* + Or-opt<br/>+ segment Or-opt, to convergence)"]
     C --> D["Vehicle-minimization pre-phase<br/>(route elimination, budget = 10% of iterations)"]
     D --> E["Local search polish"]
     E --> F[Main LNS loop]
@@ -493,11 +491,14 @@ anything else). Output is one JSON object per line on stdout: `start`/`progress`
 messages, the same protocol the browser Web Worker consumes.
 
 Go unit tests (`solver/*_test.go`) cover construction correctness (every customer routed exactly
-once, feasibility, determinism under a fixed seed), local search (never worsens, never drops
-customers), route elimination (vehicle-count reduction, no customer-ID aliasing bugs), the ALNS
-weight update mechanics, the Shaw-removal relatedness scoring (including a statistical check that
-it actually groups related customers far more often than chance), the simulated-annealing
-acceptance probability, and the stagnation/LKH decision helpers:
+once, feasibility, determinism under a fixed seed), local search (2-opt, inter-route 2-opt* tail
+swaps, single-customer and 2/3-customer segment Or-opt — never worsens, never drops customers),
+route elimination (vehicle-count reduction, no customer-ID aliasing bugs), the ALNS weight update
+mechanics, the Shaw-removal relatedness scoring (including a statistical check that it actually
+groups related customers far more often than chance) and its seeded variant used by the long-edge
+intervention, the outlier-edge detector and its firing-cap policy, the full-solution polish after a
+stagnation merge, the simulated-annealing acceptance probability, and the stagnation/LKH decision
+helpers:
 
 ```bash
 cd solver && go test ./...
