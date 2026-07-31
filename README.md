@@ -96,20 +96,37 @@ that doesn't fit the current route remains eligible for *any* later route. On th
 benchmark this produces a feasible initial solution well under the naive-nearest-neighbor baseline
 of ~28 routes / ~2806 distance; see [Results](#results) for what the full pipeline achieves.
 
-## Local search: 2-opt + Or-opt to convergence
+## Local search: 2-opt, 2-opt*, and Or-opt to convergence
 
-`localSearchImprove` alternates two intensification operators until a full round of both produces
-no further distance improvement (or a 5-round cap is hit):
+`localSearchImprove` alternates four intensification operators until a full round of all of them
+produces no further distance improvement (or a 5-round cap is hit):
 
 - **2-opt** (`twoOptRoute`, intra-route): standard edge-pair reversal to remove crossing edges
   within a single route.
-- **Or-opt** (`orOptImproveSolution`, cross-route): relocates short customer segments between
-  routes.
+- **2-opt\*** (`twoOptStarImproveSolution`, inter-route): swaps the tails of two routes at a pair
+  of cut points, without reversing either route's own visit order. This is the operator that
+  fixes two routes whose *paths* cross each other in space (one route's tail geographically
+  belongs to the other's territory) — something neither intra-route 2-opt nor single-customer
+  Or-opt can reach, since uncrossing them means moving a whole tail as a unit while preserving its
+  internal order. Only the two boundary edges at the cut points change, so the distance delta is
+  exact and O(1) per candidate cut; the expensive feasibility check
+  (`calculateRouteDetails`) only runs on a cut that could already beat the best
+  *confirmed-feasible* delta found so far — the cheapest-by-distance cut can still turn out
+  infeasible (capacity/time windows), in which case the search keeps going rather than giving up.
+- **Or-opt** (`orOptImproveSolution`, cross-route): relocates single customers between routes.
+- **Or-opt, segment** (`orOptSegmentImproveSolution`, cross-route, segment lengths 2 and 3):
+  relocates a *contiguous pair or triple* of customers as one unit, trying both orientations
+  (forward and reversed). Some improvements only become visible when two or three neighboring
+  customers move together — moving them one at a time can require passing through a worse
+  intermediate state that single-customer Or-opt would never accept, even though the end state is
+  better. Uses the same O(1)-boundary-delta-then-confirm discipline as 2-opt\*.
 
 These are run alternately, not just once each, because a move from one can re-open an opportunity
-for the other — an Or-opt relocation can leave a route in a shape 2-opt can now untangle further,
-and vice versa. This runs after construction, after the vehicle-minimization pre-phase, and after
-every accepted destroy/repair candidate in the main loop.
+for another — an Or-opt relocation can leave a route in a shape 2-opt can now untangle further, a
+2-opt\* tail swap can put two customers next to each other that Or-opt can now relocate
+profitably, and a segment relocation can free up a position single-customer Or-opt can then fill.
+This runs after construction, after the vehicle-minimization pre-phase, and after every accepted
+destroy/repair candidate in the main loop.
 
 ## Vehicle-minimization pre-phase
 
@@ -147,7 +164,10 @@ pre-phase just runs it up front, unconditionally, before distance optimization n
 
 ```mermaid
 flowchart TD
-    Start([Current solution]) --> Choose["ALNS roulette-wheel pick<br/>(weighted, adapts every 50 iters)"]
+    Start([Current solution]) --> LongEdgeCheck{"Outlier edge detected?<br/>(mean + 2.5·stddev of<br/>customer-to-customer edges)"}
+    LongEdgeCheck -- "yes, budget available<br/>(forced, bypasses roulette)" --> LED["Long-Edge Destroy<br/>(Shaw removal seeded at<br/>the outlier edge's two endpoints)"]
+    LongEdgeCheck -- "no, or budget<br/>already spent on this edge" --> Choose["ALNS roulette-wheel pick<br/>(weighted, adapts every 50 iters)"]
+
     Choose --> RE[Route Elimination]
     Choose --> WD["Worst Destroy<br/>(remove k customers,<br/>noised removal-cost ranking)"]
     Choose --> RD["Random Destroy<br/>(remove k customers<br/>uniformly)"]
@@ -157,8 +177,9 @@ flowchart TD
     WD --> Repair["repairGreedy<br/>(reinsert, new route allowed)"]
     RD --> Repair
     SD --> Repair
+    LED --> Repair
 
-    ReRepair --> Polish2["localSearchImprove<br/>(2-opt + Or-opt)"]
+    ReRepair --> Polish2["localSearchImprove<br/>(2-opt + 2-opt* + Or-opt<br/>+ segment Or-opt)"]
     Repair --> Polish2
 
     Polish2 --> Accept{Accept?}
@@ -166,7 +187,7 @@ flowchart TD
     Accept -- "same vehicles, worse distance:<br/>simulated annealing roll" --> Keep
     Accept -- otherwise --> Reject[Discard candidate]
 
-    Keep --> Reward["Credit the chosen operator's<br/>ALNS segment score"]
+    Keep --> Reward["Credit the chosen operator's<br/>ALNS segment score<br/>(skipped for Long-Edge Destroy)"]
     Reward --> Best{New global best?}
     Best -- yes --> UpdateBest[Update best solution<br/>reset stagnation counter]
     Best -- no --> Continue[Continue]
@@ -177,11 +198,12 @@ flowchart TD
     IncStag --> Next
 ```
 
-Each iteration: pick a destroy operator → destroy → repair → local-search polish → accept/reject
-→ credit the operator → check stagnation. `k` (customers removed per iteration, for Worst/Random/
-Shaw) is drawn uniformly from `[max(2, 5% of customers), max(5, 30% of customers)]` each iteration.
+Each iteration: check for a long-edge outlier → pick a destroy operator (forced or roulette) →
+destroy → repair → local-search polish → accept/reject → credit the operator → check stagnation.
+`k` (customers removed per iteration, for Worst/Random/Shaw/Long-Edge) is drawn uniformly from
+`[max(2, 5% of customers), max(5, 30% of customers)]` each iteration.
 
-### Destroy operators - adaptive (ALNS) selection
+### Destroy operators - adaptive (ALNS) selection, plus one forced intervention
 
 Rather than a fixed split, which operator fires each iteration is chosen by roulette wheel over
 weights that adapt to what's actually been productive on *this* instance (`alnsWeights`, loosely
@@ -190,6 +212,22 @@ weight 1.0; each iteration's chosen operator is credited a score based on its ou
 best > tied-vehicle improvement > accepted-but-worse); every 50 iterations, weights are updated
 from each operator's average score that segment (`w = w·(1−r) + r·avgScore`, reaction factor
 `r = 0.2`).
+
+**Long-Edge Destroy is not part of this roulette** — it's a forced intervention, checked every
+iteration before the roulette wheel even runs (`detectLongEdgeOutlier`): if the current solution's
+worst customer-to-customer edge exceeds `mean + 2.5·stddev` of every customer-to-customer edge in
+the solution (depot-adjacent edges excluded — they're routinely long for legitimate reasons and
+would skew the statistic), a Shaw-style removal is seeded directly at that edge's two endpoints
+(`destroyShawSeeded`) instead of Shaw Destroy's usual random seed. This targets the exact failure
+mode a fixed roulette weight can't reliably reach on its own: a single pathological long edge
+surviving inside an otherwise-converged solution, which local search alone didn't clean up (often
+because it sits at a seam the stagnation intervention's merge only polished in isolation — see
+below). Each specific flagged edge (identified by its two endpoint IDs, order-independent) gets
+exactly one forced attempt before falling back to the roulette every iteration after — detection
+re-runs every iteration, so a persisting problem gets re-flagged and re-evaluated on its own later
+rather than being starved forever on one edge or dominating every iteration. A different
+newly-flagged edge (or the same edge recurring after being resolved) always gets a fresh budget.
+Bypasses `alnsWeights` entirely - never credited or penalized, since it isn't one of its operators.
 
 **Deviation from canonical ALNS, worth knowing before you tune it:** a *rejected* candidate is not
 credited at all (score 0 is never recorded) - `segmentUsage` for that operator simply isn't
@@ -211,6 +249,7 @@ its own before/after benchmark rather than being bundled silently into this pass
 | **Worst Destroy** | Remove the `k` customers whose removal saves the most route distance (`destroyWorst`), with random noise added to the ranking so it isn't perfectly greedy every time. |
 | **Random Destroy** | Remove `k` uniformly random customers (`destroyRandom`). |
 | **Shaw Destroy** | Remove a *related* cluster of `k` customers (`destroyShaw`) - see below. |
+| **Long-Edge Destroy** *(forced, not roulette)* | Shaw-style removal seeded at a detected outlier edge's two endpoints (`destroyShawSeeded`), rather than a random seed - see below. |
 
 **Shaw (relatedness-based) removal** (Shaw, 1997; the weighted-term formulation is Ropke &
 Pisinger's): grows a removal set by repeatedly picking, from a random already-removed "anchor"
@@ -259,8 +298,14 @@ If `stagnationCounter` (consecutive non-improving iterations) reaches `-stagnati
    - the **pure-Go sub-solver** (default): I1 construction on just the destroyed customers, then
      50 sub-iterations of a small destroy/repair LNS on that subset, then a local-search polish; or
    - **LKH3** (`-use-lkh`), see below.
-3. **Merge** the resolved subproblem's routes back with the untouched routes, and accept the merge
-   only if it improves on the pre-intervention best.
+3. **Merge** the resolved subproblem's routes back with the untouched routes
+   (`mergeStagnationSubSolution`), run a full `localSearchImprove` pass over the *merged* solution,
+   and accept the result only if it improves on the pre-intervention best. The pure-Go sub-solver
+   path already polishes the subproblem in isolation before this point (LKH-sourced results skip
+   that, since LKH searches far more thoroughly than a 2-opt/Or-opt pass over its output would
+   add) — but neither path ever looks at the *seam* between the untouched routes and the re-solved
+   ones, which is exactly where a bad connector edge between two clusters can survive. This
+   full-solution polish is what closes that gap.
 4. If it doesn't improve, retry up to `maxAttempts = 3` times with different candidate routes
    (destroy-route selection excludes previously-tried combinations via a `history` list) before
    giving up and reverting to the pre-intervention solution.
@@ -339,12 +384,65 @@ Results were not run in this pass across the full 56-instance Solomon/Homberger 
 `public/data/`, nor across multiple seeds per instance (the before/after table above is n=1 per
 side) — both would be natural next steps for anyone forking this to benchmark systematically.
 
+**Before/after a later pass** (2-opt\* inter-route tail swap, 2/3-customer segment Or-opt, the
+long-edge-triggered forced Shaw removal, and running `localSearchImprove` on the full solution
+after a stagnation merge instead of just the sub-solve). **`-iterations 1000` here, not 2000 like
+the section above** — same seeds (42, 43) on both sides, n=2 per instance per side. Still a spot
+check, not a statistically powered benchmark, but n=2 catches at least one obvious seed-dependent
+swing that n=1 can't:
+
+| Instance | Before | After | Change |
+|---|---|---|---|
+| C101 (seed 42/43) | 10 veh / 828.9369 (16.0s / 15.5s) | 10 veh / 828.9369 (37.1s / 33.4s) | **no distance change (still exactly optimal)**, but ~2.2x slower - the three new operators all run every iteration inside `localSearchImprove`, and C101 converges fast enough that this per-iteration overhead dominates its wall-clock more visibly than on the harder instances below |
+| RC204 (seed 42/43) | 3 veh / 839.77 (185.0s), 3 veh / 835.55 (204.7s) | 3 veh / 803.77 (174.6s), 3 veh / 798.97 (253.8s) | **~4.3-4.4% shorter distance on both seeds**, wall-clock roughly flat (one seed faster, one slower) |
+| R204 (seed 42/43) | 3 veh / 766.62 (205.0s), 2 veh / 884.24 (256.9s) | 2 veh / 866.30 (426.6s), 2 veh / 870.01 (375.6s) | **seed 42 now reaches the 2-vehicle solution it previously got stuck short of at 3** (the primary, hierarchical part of the objective) - seed 43 stayed at 2 vehicles with 1.6% shorter distance - both at roughly double the wall-clock |
+
+R204 seed 42 is the standout: before this pass, that specific seed's search trajectory got stuck at
+3 vehicles for the full 1000-iteration budget; after, it reaches the 2-vehicle solution both other
+seeds already found. Since vehicle count is the *first* tier of this project's hierarchical
+objective, that's a more meaningful result than any distance percentage - but it came at roughly
+2x the wall-clock, and it's one seed, so treat "reaches 2 vehicles more reliably" as a plausible
+direction, not a proven property.
+
+**Geometric confirmation on the pathology that motivated this pass** (see "Long-Edge Destroy"
+above) - re-running the crossing/outlier-edge analysis from the diagnosis that started this work,
+against RC204's own results:
+
+| Seed | Worst edge (before → after) | vs. that solution's own outlier threshold | Crossing pairs (before → after) |
+|---|---|---|---|
+| 42 | 31.4 → 23.5 | before: well above (22.4); after: still above, but by less (20.6) | 7 → 4 |
+| 43 | 26.9 → 20.6 | before: above (21.5); after: essentially at the line (19.9) | 4 → 5 |
+
+The worst edge shrank substantially on both seeds (−25%, −23%) and crossings dropped on one seed -
+but neither run's worst edge actually fell *below* its own outlier threshold, because the threshold
+is relative to that solution's own (now tighter) edge-length distribution: local search shortening
+the typical edge also lowers the bar for what counts as an outlier. Crossing count ticking up
+slightly on seed 43 despite better distance is consistent with this repo's own finding during the
+original diagnosis that best-known RC204 solutions aren't crossing-free either - crossings under
+time windows aren't inherently a defect on their own. Read this as "the specific pathology got
+smaller, not that it's eliminated" - a stronger claim would need it verified across more seeds and
+instances than fit in this pass.
+
 ## Known limitations / places to improve
 
 This is deliberately not a from-the-literature textbook ALNS implementation, and there are still
 several places where a more principled approach would likely do better. Listed roughly in the
 order an OR practitioner would probably want to attack them:
 
+- **2-opt\*/segment Or-opt/Long-Edge Destroy measurably slow down every iteration, most visibly on
+  instances that were already easy.** C101 (already-optimal, fast-converging) got ~2.2x slower for
+  no distance change under the same iteration budget - the new operators all run inside
+  `localSearchImprove`, which fires after every accepted candidate regardless of whether the
+  instance still has room to improve. A production deployment might want to skip the more
+  expensive operators (2-opt\*, segment Or-opt) once a run has been stagnant-and-optimal for a
+  while, rather than always paying for them.
+- **The long-edge outlier threshold is self-relative and can chase itself.** Since `mean +
+  2.5·stddev` is computed from the *current* solution's own edge lengths, tightening the typical
+  edge (which local search does as a side effect of everything else) also tightens the bar for
+  what counts as an outlier - so a shrinking-but-still-real pathological edge can stay just above
+  threshold indefinitely instead of ever clearing it outright (observed on RC204 - see "Results").
+  A fixed relative margin off the *best-known* distance, or a percentile-based cutoff instead of a
+  parametric one, might converge more cleanly, at the cost of an extra tunable.
 - **ALNS reward/reaction-factor constants are hand-picked, not tuned.** The segment length (50),
   reaction factor (0.2), and reward ratios (15/5/1 for new-best/improved/accepted) are reasonable
   defaults, not the result of any tuning sweep on this instance set.

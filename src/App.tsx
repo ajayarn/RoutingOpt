@@ -595,7 +595,10 @@ export default function App() {
           </div>
           <div>
             <h1 className="text-xl font-bold tracking-tight text-slate-900" id="header-title">VRPTW Optimization Engine</h1>
-            <p className="text-xs text-slate-500 font-normal">Vehicle Routing Problem with Time Windows Solver utilizing LNS metaheuristics with an optional LKH3 sub-solver</p>
+            <p className="text-xs text-slate-500 font-normal">
+              Vehicle Routing Problem with Time Windows Solver utilizing LNS metaheuristics with an optional LKH3 sub-solver
+              [Click: <a href="https://www.sintef.no/projectweb/top/vrptw/100-customers/" target="_problem">100 Customers</a>]
+            </p>
           </div>
         </div>
         <div className="flex items-center space-x-3">

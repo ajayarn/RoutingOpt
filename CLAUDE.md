@@ -204,12 +204,29 @@ details README.md doesn't cover.
   Budgeted at 10% of `-iterations`, logged under the `VEHICLE-MIN` category. See
   `docs/superpowers/specs/2026-07-27-route-elimination-operator-design.md` for why this runs
   up front rather than only reactively.
-- **Destroy operators**: four - Route Elimination, Worst Destroy, Random Destroy, and Shaw
-  (relatedness-based) Destroy - chosen each iteration by ALNS adaptive roulette-wheel weighting
-  (`alnsWeights`), not a fixed split. Weights start equal and are reweighted every 50 iterations
-  from each operator's average reward that segment (new-best > tied-vehicle improvement >
-  accepted-but-worse > nothing for a reject). See README.md's "Destroy operators" section for the
-  full mechanics and Shaw removal's relatedness formula.
+- **Local search**: `localSearchImprove` alternates four operators to convergence (or a 5-round
+  cap) after construction, after every accepted destroy/repair candidate, and after a stagnation
+  merge (see below) - intra-route 2-opt (`twoOptRoute`), inter-route tail-swap 2-opt*
+  (`twoOptStarImproveSolution`), single-customer cross-route Or-opt (`orOptImproveSolution`), and
+  2/3-customer segment cross-route Or-opt (`orOptSegmentImproveSolution`). The last three are
+  cross-route moves 2-opt alone can't make; 2-opt* and the segment variant both use an O(1)
+  boundary-delta pre-filter before the expensive feasibility check, since only the edges at the
+  cut/insertion point change. See README.md's "Local search" section for the full mechanics.
+- **Destroy operators**: four ALNS-roulette-weighted operators - Route Elimination, Worst Destroy,
+  Random Destroy, and Shaw (relatedness-based) Destroy - chosen each iteration by adaptive
+  roulette-wheel weighting (`alnsWeights`), not a fixed split. Weights start equal and are
+  reweighted every 50 iterations from each operator's average reward that segment (new-best >
+  tied-vehicle improvement > accepted-but-worse > nothing for a reject). A fifth mechanism, **Long-
+  Edge Destroy**, sits outside this roulette entirely: a forced intervention (checked every
+  iteration, same pattern as the stagnation intervention below) that fires when the current
+  solution's worst customer-to-customer edge is a statistical outlier (`detectLongEdgeOutlier`,
+  `mean + 2.5·stddev` of that solution's own customer-to-customer edges, depot legs excluded), and
+  anchors a Shaw-style removal directly at that edge's two endpoints (`destroyShawSeeded`) instead
+  of Shaw Destroy's random seed. Capped at one forced attempt per specific flagged edge (detection
+  re-runs every iteration, so a persisting problem gets re-evaluated later rather than starving the
+  roulette or being retried needlessly on an edge that isn't resolving) and never credited/
+  penalized via `alnsWeights`. See README.md's "Destroy operators" section for the full mechanics
+  and Shaw removal's relatedness formula.
 - **Repair**: greedy insertion (`repairGreedy`); Route Elimination uses
   `repairGreedyNoNewRoute` instead (reinsertion into existing routes only, never opens a new
   one).
@@ -222,7 +239,10 @@ details README.md doesn't cover.
   → `mostRelatedRoutes`, reusing the same `customerRelatedness` scoring Shaw removal uses) and
   re-solves the freed customers, escalating destroy size across up to 3 attempts if it doesn't
   improve. Route re-solving is either the pure-Go heuristic (default) or LKH3
-  (`invokeLKHSubSolver`) depending on `-use-lkh` — see above.
+  (`invokeLKHSubSolver`) depending on `-use-lkh` — see above. The re-solved routes are merged back
+  with the untouched ones via `mergeStagnationSubSolution`, which runs a full `localSearchImprove`
+  pass over the *merged* solution (not just the sub-solve in isolation) before accepting it - this
+  is what cleans up a bad connector edge at the seam between untouched and re-solved routes.
 - **Multi-start**: `-restarts N` (native CLI only, default 1, browser worker never passes anything
   else) runs N full independent solves sequentially with seed, seed+1, ..., keeping the best
   (`isBetterSolution`) as the final result.

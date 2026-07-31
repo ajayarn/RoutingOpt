@@ -307,6 +307,11 @@ func main() {
 			coolingRate = math.Pow(finalTemperature/temperature, 1.0/float64(*iterations))
 		}
 
+		// Long-edge forced-intervention tracking - see detectLongEdgeOutlier
+		// and longEdgeMaxConsecutiveFirings below.
+		longEdgeLastFlagged := [2]int{}
+		longEdgeFiringCount := 0
+
 		// 3. Solver Loop (LNS)
 		for iter := 1; iter <= *iterations; iter++ {
 			currentSol := cloneSolution(sol)
@@ -314,39 +319,69 @@ func main() {
 			// Decide how many customers to destroy
 			k := rand.Intn(maxDestroy-minDestroy+1) + minDestroy
 
+			// Long-edge-triggered forced intervention: if the current solution
+			// has a statistical outlier edge (see detectLongEdgeOutlier), skip
+			// the normal ALNS roulette for this iteration and anchor a
+			// Shaw-style removal directly at its two endpoints, rather than
+			// waiting on chance to both pick Shaw Destroy and randomly seed
+			// near the bad edge. Same forced-intervention pattern as the
+			// stagnation branch further below, but reacting to a structural
+			// signal (a specific outlier edge) instead of a
+			// no-improvement counter. Bypasses alnsWeights entirely for this
+			// iteration - opIdx stays -1 and is never rewarded (see below).
+			forceLongEdge := false
+			var longEdgeAnchor routeEdge
+			outlierEdge, outlierFound := detectLongEdgeOutlier(currentSol, customerMap)
+			outlierKey := sortedPair(outlierEdge.FromID, outlierEdge.ToID)
+			forceLongEdge, longEdgeLastFlagged, longEdgeFiringCount = longEdgeShouldForce(outlierFound, outlierKey, longEdgeLastFlagged, longEdgeFiringCount)
+			if forceLongEdge {
+				longEdgeAnchor = outlierEdge
+			}
+
 			// 1. Destroy + 2. Repair
-			opIdx := weights.choose(rand.Float64())
-			destroyType := destroyOperatorNames[opIdx]
+			opIdx := -1
+			var destroyType string
 			var candidateSol Solution
 
-			switch destroyType {
-			case "Route Elimination":
-				eliminated, ok := tryRouteElimination(currentSol, customerMap, depot, capacity, 3)
-				sendProgressLog(iter, bestSol, startTime, "LNS:CHOOSE", "Neighborhood '%s' attempted (success=%v)", destroyType, ok)
-				if ok {
-					candidateSol = eliminated
-				} else {
-					candidateSol = currentSol
-				}
-			default:
-				var removed []int
-				var partialSol Solution
-				switch destroyType {
-				case "Worst Destroy":
-					partialSol, removed = destroyWorst(currentSol, k, customerMap, depot)
-				case "Shaw Destroy":
-					partialSol, removed = destroyShaw(currentSol, k, customerMap, depot)
-				default: // "Random Destroy"
-					partialSol, removed = destroyRandom(currentSol, k, customerMap, depot)
-				}
-				sendProgressLog(iter, bestSol, startTime, "LNS:CHOOSE", "Neighborhood '%s' selected to remove %d customers: %v", destroyType, k, removed)
+			if forceLongEdge {
+				destroyType = "Long-Edge Destroy"
+				partialSol, removed := destroyShawSeeded(currentSol, k, customerMap, depot, []int{longEdgeAnchor.FromID, longEdgeAnchor.ToID})
+				sendProgressLog(iter, bestSol, startTime, "LNS:CHOOSE", "Forced intervention '%s' targeting outlier edge %d-%d (%.2f units) - removing %d customers: %v", destroyType, longEdgeAnchor.FromID, longEdgeAnchor.ToID, longEdgeAnchor.Length, k, removed)
 				candidateSol = repairGreedy(partialSol, removed, customerMap, depot, capacity)
-				// Tighten every repaired candidate before it's judged for
-				// acceptance - greedy insertion alone routinely leaves crossing
-				// edges and out-of-order visits that 2-opt/Or-opt can remove for
-				// free (Route Elimination's candidate is already tightened
-				// inside tryRouteElimination itself).
 				candidateSol = localSearchImprove(candidateSol, customerMap, depot, capacity)
+			} else {
+				opIdx = weights.choose(rand.Float64())
+				destroyType = destroyOperatorNames[opIdx]
+
+				switch destroyType {
+				case "Route Elimination":
+					eliminated, ok := tryRouteElimination(currentSol, customerMap, depot, capacity, 3)
+					sendProgressLog(iter, bestSol, startTime, "LNS:CHOOSE", "Neighborhood '%s' attempted (success=%v)", destroyType, ok)
+					if ok {
+						candidateSol = eliminated
+					} else {
+						candidateSol = currentSol
+					}
+				default:
+					var removed []int
+					var partialSol Solution
+					switch destroyType {
+					case "Worst Destroy":
+						partialSol, removed = destroyWorst(currentSol, k, customerMap, depot)
+					case "Shaw Destroy":
+						partialSol, removed = destroyShaw(currentSol, k, customerMap, depot)
+					default: // "Random Destroy"
+						partialSol, removed = destroyRandom(currentSol, k, customerMap, depot)
+					}
+					sendProgressLog(iter, bestSol, startTime, "LNS:CHOOSE", "Neighborhood '%s' selected to remove %d customers: %v", destroyType, k, removed)
+					candidateSol = repairGreedy(partialSol, removed, customerMap, depot, capacity)
+					// Tighten every repaired candidate before it's judged for
+					// acceptance - greedy insertion alone routinely leaves crossing
+					// edges and out-of-order visits that 2-opt/Or-opt can remove for
+					// free (Route Elimination's candidate is already tightened
+					// inside tryRouteElimination itself).
+					candidateSol = localSearchImprove(candidateSol, customerMap, depot, capacity)
+				}
 			}
 
 			// 3. Evaluate & Decide (Acceptance criterion)
@@ -396,13 +431,18 @@ func main() {
 
 			// Credit this iteration's chosen operator per the ALNS scheme (see
 			// alnsWeights) and reweight every alnsSegmentLength iterations.
-			switch {
-			case improvedThisIter:
-				weights.reward(opIdx, alnsRewardNewBest)
-			case objectiveImprovement:
-				weights.reward(opIdx, alnsRewardImproved)
-			case accept:
-				weights.reward(opIdx, alnsRewardAccepted)
+			// opIdx is -1 when the long-edge forced intervention fired instead
+			// of the roulette wheel - it isn't one of alnsWeights' operators
+			// and is never rewarded or penalized.
+			if opIdx != -1 {
+				switch {
+				case improvedThisIter:
+					weights.reward(opIdx, alnsRewardNewBest)
+				case objectiveImprovement:
+					weights.reward(opIdx, alnsRewardImproved)
+				case accept:
+					weights.reward(opIdx, alnsRewardAccepted)
+				}
 			}
 			if iter%alnsSegmentLength == 0 {
 				weights.updateSegment(alnsReactionFactor)
@@ -583,24 +623,11 @@ func main() {
 								}
 							}
 
-							// Merge back
-							var mergedRoutes []Route
-							for _, r := range untouchedRoutes {
-								mergedRoutes = append(mergedRoutes, r)
-							}
-							for _, r := range subSol.Routes {
-								mergedRoutes = append(mergedRoutes, r)
-							}
+							// Merge back and polish the seam between untouched and
+							// re-solved routes (see mergeStagnationSubSolution).
+							mergedSol := mergeStagnationSubSolution(untouchedRoutes, subSol, customerMap, depot, capacity)
 
-							// Re-index vehicle IDs
-							for idx := range mergedRoutes {
-								mergedRoutes[idx].VehicleID = idx + 1
-							}
-
-							mergedSol := Solution{Routes: mergedRoutes}
-							recalculateSolutionMetrics(&mergedSol)
-
-							sendProgressLog(iter, bestSol, startTime, "HEURISTIC:MERGE", "Merged subproblem routes back. Merged full candidate: %d vehicles, %.2f distance.", mergedSol.TotalVehicles, mergedSol.TotalDistance)
+							sendProgressLog(iter, bestSol, startTime, "HEURISTIC:MERGE", "Merged subproblem routes back and polished with local search. Merged+polished candidate: %d vehicles, %.2f distance.", mergedSol.TotalVehicles, mergedSol.TotalDistance)
 
 							// Check if this improved the pre-heuristic best solution
 							if mergedSol.TotalVehicles < originalBestSol.TotalVehicles || (mergedSol.TotalVehicles == originalBestSol.TotalVehicles && mergedSol.TotalDistance < originalBestSol.TotalDistance) {
@@ -1289,6 +1316,17 @@ func computeRelatednessContext(sol Solution, customers map[int]Customer) (map[in
 // the 3-8 range commonly used in the ALNS literature.
 const shawRandomization = 6.0
 
+// routedCustomerIDs returns every customer ID currently assigned to a route
+// in sol, sorted for deterministic iteration order.
+func routedCustomerIDs(sol Solution) []int {
+	var ids []int
+	for _, r := range sol.Routes {
+		ids = append(ids, r.CustomerIDs...)
+	}
+	sort.Ints(ids)
+	return ids
+}
+
 // destroyShaw implements Shaw (relatedness-based) removal: unlike
 // Worst/Random removal, which have no notion of which removed customers
 // belong together, this grows a removal set by repeatedly picking - from a
@@ -1296,8 +1334,29 @@ const shawRandomization = 6.0
 // customer (customerRelatedness), randomized by shawRandomization rather
 // than picked purely greedily. The intent is a removal set a repair pass can
 // plausibly re-cluster onto a single route, which is exactly the kind of
-// structural move Worst/Random removal can't reliably produce.
+// structural move Worst/Random removal can't reliably produce. Seeds with a
+// single random customer, then delegates the actual growth loop to
+// destroyShawSeeded.
 func destroyShaw(sol Solution, k int, customers map[int]Customer, depot Customer) (Solution, []int) {
+	routedIDs := routedCustomerIDs(sol)
+	if len(routedIDs) == 0 {
+		return sol, nil
+	}
+	seed := routedIDs[rand.Intn(len(routedIDs))]
+	return destroyShawSeeded(sol, k, customers, depot, []int{seed})
+}
+
+// destroyShawSeeded is destroyShaw's relatedness-growth loop, generalized to
+// accept the initial seed set instead of drawing one at random - destroyShaw
+// itself is a thin wrapper that seeds with one random customer, so this
+// change is behavior-neutral for destroyShaw's own callers. Used directly by
+// the long-edge intervention (see detectLongEdgeOutlier) to anchor removal
+// at a specific pathological edge's two endpoints instead of an arbitrary
+// starting point. k is raised (never lowered) to at least len(seedIDs) so
+// every requested seed survives into the result; if none of seedIDs are
+// actually routed, falls back to a single random seed rather than removing
+// nothing.
+func destroyShawSeeded(sol Solution, k int, customers map[int]Customer, depot Customer, seedIDs []int) (Solution, []int) {
 	arrival, params := computeRelatednessContext(sol, customers)
 
 	routedIDs := make([]int, 0, len(arrival))
@@ -1312,6 +1371,9 @@ func destroyShaw(sol Solution, k int, customers map[int]Customer, depot Customer
 	if k > len(routedIDs) {
 		k = len(routedIDs)
 	}
+	if k < len(seedIDs) {
+		k = len(seedIDs)
+	}
 	if k < 1 {
 		k = 1
 	}
@@ -1321,9 +1383,21 @@ func destroyShaw(sol Solution, k int, customers map[int]Customer, depot Customer
 		remaining[id] = true
 	}
 
-	seed := routedIDs[rand.Intn(len(routedIDs))]
-	removed := []int{seed}
-	delete(remaining, seed)
+	var removed []int
+	for _, id := range seedIDs {
+		if remaining[id] {
+			removed = append(removed, id)
+			delete(remaining, id)
+		}
+	}
+	if len(removed) == 0 {
+		// Defensive fallback: none of the requested seeds are currently
+		// routed (e.g. stale caller state) - behave like a plain
+		// random-seeded Shaw removal rather than removing nothing.
+		fallbackSeed := routedIDs[rand.Intn(len(routedIDs))]
+		removed = append(removed, fallbackSeed)
+		delete(remaining, fallbackSeed)
+	}
 
 	for len(removed) < k {
 		anchorID := removed[rand.Intn(len(removed))]
@@ -1379,6 +1453,139 @@ func destroyShaw(sol Solution, k int, customers map[int]Customer, depot Customer
 	partialSol := Solution{Routes: newRoutes}
 	recalculateSolutionMetrics(&partialSol)
 	return partialSol, removed
+}
+
+// routeEdge identifies a single customer-to-customer edge within a route.
+// Depot-adjacent edges are deliberately never represented by this type - see
+// customerCustomerEdges.
+type routeEdge struct {
+	RouteIdx     int
+	FromID, ToID int
+	Length       float64
+}
+
+// customerCustomerEdges returns every edge strictly between two routed
+// customers across sol - depot legs are excluded because they're routinely
+// long for entirely legitimate reasons (a route's territory can be far from
+// the depot) and would both skew the mean/stddev detectLongEdgeOutlier
+// computes and lack a second customer endpoint to anchor a targeted removal
+// on.
+func customerCustomerEdges(sol Solution, customers map[int]Customer) []routeEdge {
+	var edges []routeEdge
+	for rIdx, r := range sol.Routes {
+		ids := r.CustomerIDs
+		for i := 0; i+1 < len(ids); i++ {
+			fromID, toID := ids[i], ids[i+1]
+			edges = append(edges, routeEdge{
+				RouteIdx: rIdx,
+				FromID:   fromID,
+				ToID:     toID,
+				Length:   distance(customers[fromID], customers[toID]),
+			})
+		}
+	}
+	return edges
+}
+
+// longEdgeOutlierStdDevs (k): an edge is flagged only if it exceeds this
+// solution's own customer-to-customer mean edge length by more than k
+// standard deviations - relative to THIS solution's own edge-length
+// distribution, not a fixed absolute unit count, so the same threshold
+// generalizes across every Solomon/Homberger instance regardless of
+// coordinate scale. 2.5 was calibrated against real solver output: it
+// reliably catches edges several times the mean without also flagging
+// routine longer-than-average edges.
+const longEdgeOutlierStdDevs = 2.5
+
+// detectLongEdgeOutlier flags the single longest customer-to-customer edge
+// in sol if it clears mean + longEdgeOutlierStdDevs*stddev of every
+// customer-to-customer edge in sol. ok=false if there are fewer than 2 such
+// edges (not enough to compute a meaningful stddev) or nothing clears the
+// bar.
+func detectLongEdgeOutlier(sol Solution, customers map[int]Customer) (routeEdge, bool) {
+	edges := customerCustomerEdges(sol, customers)
+	if len(edges) < 2 {
+		return routeEdge{}, false
+	}
+
+	var sum float64
+	for _, e := range edges {
+		sum += e.Length
+	}
+	mean := sum / float64(len(edges))
+
+	var variance float64
+	for _, e := range edges {
+		diff := e.Length - mean
+		variance += diff * diff
+	}
+	variance /= float64(len(edges))
+	stddev := math.Sqrt(variance)
+
+	threshold := mean + longEdgeOutlierStdDevs*stddev
+
+	worst := edges[0]
+	for _, e := range edges[1:] {
+		if e.Length > worst.Length {
+			worst = e
+		}
+	}
+
+	if worst.Length <= threshold {
+		return routeEdge{}, false
+	}
+	return worst, true
+}
+
+// sortedPair returns (a,b) ordered smallest-first, so two customer IDs
+// identify the same edge regardless of which one is FromID vs ToID - used to
+// recognize "the same flagged edge as last iteration" in
+// longEdgeShouldForce.
+func sortedPair(a, b int) [2]int {
+	if a > b {
+		a, b = b, a
+	}
+	return [2]int{a, b}
+}
+
+// longEdgeMaxConsecutiveFirings bounds how many consecutive iterations the
+// long-edge forced intervention (see longEdgeShouldForce) will target the
+// SAME flagged edge before backing off to the normal ALNS roulette. Set to 1
+// deliberately: detection re-runs every iteration, so an edge that's still a
+// problem gets re-flagged and re-evaluated on its own in a later iteration
+// anyway - there's no need to spend more than one consecutive attempt on it
+// before giving the roulette wheel (and the rest of the solve) a turn.
+const longEdgeMaxConsecutiveFirings = 1
+
+// longEdgeShouldForce decides whether the long-edge intervention should fire
+// this iteration, given whether an outlier edge was found (found, key) and
+// the firing-cap state carried over from the previous iteration
+// (lastFlagged, firingCount). Returns whether to force this iteration, plus
+// the (possibly reset) state to carry into the next one. Pure and
+// side-effect-free so the firing-cap policy can be unit tested without
+// spinning up the full solver loop.
+//
+// A naive counter that just counts consecutive firings regardless of WHICH
+// edge is flagged would starve the roulette wheel forever on a genuinely
+// unfixable edge (force/force/.../normal/force/force/... in an endless
+// cycle capped only by the firing limit, then immediately re-arming because
+// the edge is still the worst one next iteration). Keying the budget to the
+// specific flagged edge instead means a persistently unfixable edge gets
+// exactly longEdgeMaxConsecutiveFirings attempts total and then is left
+// alone (falls through to roulette every iteration after), while a
+// DIFFERENT newly-flagged edge - or the same edge recurring after having
+// been resolved - always gets a fresh budget.
+func longEdgeShouldForce(found bool, key [2]int, lastFlagged [2]int, firingCount int) (force bool, newLastFlagged [2]int, newFiringCount int) {
+	if !found {
+		return false, [2]int{}, 0
+	}
+	if key != lastFlagged {
+		lastFlagged, firingCount = key, 0
+	}
+	if firingCount < longEdgeMaxConsecutiveFirings {
+		return true, lastFlagged, firingCount + 1
+	}
+	return false, lastFlagged, firingCount
 }
 
 // destroyRouteElimination removes the entire route at routeIdx (not a
@@ -1643,6 +1850,142 @@ func twoOptImproveSolution(sol Solution, customers map[int]Customer, depot Custo
 	return improved
 }
 
+// twoOptStarRoutePairBestMove scans every cut-point pair between routeA and
+// routeB for the most-improving feasible inter-route 2-opt* tail swap: pick
+// a cut i in A and j in B, then reconnect as newA = A[:i]+B[j:] and
+// newB = B[:j]+A[i:]. Unlike twoOptRoute, neither route's internal customer
+// order is reversed - this only recombines two routes' prefixes/suffixes,
+// which is what lets two routes whose paths cross in space (one route's
+// tail geographically belongs to the other) uncross without touching either
+// route's own visit order.
+//
+// Only two boundary edges change - (a,b) in A and (c,d) in B, where a/b are
+// the customers either side of cut i (or depot, at the route's own end) and
+// c/d the same for cut j - so the total-distance delta is exact and O(1) to
+// compute per (i,j): delta = [dist(a,d)+dist(c,b)] - [dist(a,b)+dist(c,d)].
+// (The depot-return edges at each route's far end are unaffected by the
+// cut because a customer's distance to the depot is the same regardless of
+// which route array it ends up in - those terms cancel out of the delta.)
+// This lets the expensive calculateRouteDetails feasibility check run only
+// on candidates that could beat the best CONFIRMED-feasible delta found so
+// far, not every cut pair - the cheapest-by-distance cut can still turn out
+// infeasible (capacity/time windows), in which case the search keeps going
+// rather than giving up, since a less-cheap-but-feasible cut may still beat
+// doing nothing. The two cuts (i=0,j=0) and (i=nA,j=nB) are skipped as true
+// no-ops - the first swaps both routes' entire contents (same solution,
+// swapped labels), the second changes nothing.
+func twoOptStarRoutePairBestMove(routeA, routeB Route, customers map[int]Customer, depot Customer, capacity float64) (newA, newB Route, improved bool) {
+	idsA := routeA.CustomerIDs
+	idsB := routeB.CustomerIDs
+	nA, nB := len(idsA), len(idsB)
+
+	endpoint := func(ids []int, pos int) Customer {
+		if pos <= 0 {
+			return depot
+		}
+		return customers[ids[pos-1]]
+	}
+	start := func(ids []int, pos int) Customer {
+		if pos >= len(ids) {
+			return depot
+		}
+		return customers[ids[pos]]
+	}
+
+	// bestConfirmedDelta only ever holds a delta that's both improving and
+	// already confirmed feasible - the cheapest-by-distance cut can turn out
+	// infeasible (capacity/time-window), so every candidate whose delta
+	// beats the current best CONFIRMED value gets checked, not just the
+	// single cheapest one overall. This still only calls the expensive
+	// calculateRouteDetails on candidates that could actually win.
+	const improvementTolerance = -1e-9
+	bestConfirmedDelta := improvementTolerance
+	bestI := -1
+	var bestDetailsA, bestDetailsB Route
+
+	for i := 0; i <= nA; i++ {
+		a := endpoint(idsA, i)
+		b := start(idsA, i)
+		for j := 0; j <= nB; j++ {
+			if (i == 0 && j == 0) || (i == nA && j == nB) {
+				continue
+			}
+			c := endpoint(idsB, j)
+			d := start(idsB, j)
+
+			delta := (distance(a, d) + distance(c, b)) - (distance(a, b) + distance(c, d))
+			if delta >= bestConfirmedDelta {
+				continue
+			}
+
+			newAIDs := make([]int, 0, i+(nB-j))
+			newAIDs = append(newAIDs, idsA[:i]...)
+			newAIDs = append(newAIDs, idsB[j:]...)
+
+			newBIDs := make([]int, 0, j+(nA-i))
+			newBIDs = append(newBIDs, idsB[:j]...)
+			newBIDs = append(newBIDs, idsA[i:]...)
+
+			detailsA, okA := calculateRouteDetails(newAIDs, customers, depot, capacity)
+			if !okA {
+				continue
+			}
+			detailsB, okB := calculateRouteDetails(newBIDs, customers, depot, capacity)
+			if !okB {
+				continue
+			}
+
+			bestConfirmedDelta = delta
+			bestI = i
+			bestDetailsA, bestDetailsB = detailsA, detailsB
+		}
+	}
+
+	if bestI == -1 {
+		return routeA, routeB, false
+	}
+
+	bestDetailsA.VehicleID = routeA.VehicleID
+	bestDetailsB.VehicleID = routeB.VehicleID
+	return bestDetailsA, bestDetailsB, true
+}
+
+// twoOptStarImproveSolution applies twoOptStarRoutePairBestMove across every
+// unordered pair of routes, once per pass, to convergence or maxPasses.
+// Summed over all route pairs, the total (i,j) cuts checked is bounded by
+// N²/2 for N total routed customers regardless of how many routes N is
+// split across - more/smaller routes means more pairs but smaller products,
+// fewer/larger routes means fewer pairs but larger products, and they
+// cancel. At most one move is applied per route pair per pass (reusing the
+// same bounded-passes idiom orOptImproveSolution uses) since a pair whose
+// shape just changed gets a fresh, correct scan next pass rather than a
+// stale one this pass.
+func twoOptStarImproveSolution(sol Solution, customers map[int]Customer, depot Customer, capacity float64, maxPasses int) Solution {
+	improved := cloneSolution(sol)
+
+	for pass := 0; pass < maxPasses; pass++ {
+		anyImprovement := false
+
+		for i := 0; i < len(improved.Routes); i++ {
+			for j := i + 1; j < len(improved.Routes); j++ {
+				newA, newB, ok := twoOptStarRoutePairBestMove(improved.Routes[i], improved.Routes[j], customers, depot, capacity)
+				if ok {
+					improved.Routes[i] = newA
+					improved.Routes[j] = newB
+					anyImprovement = true
+				}
+			}
+		}
+
+		recalculateSolutionMetrics(&improved)
+		if !anyImprovement {
+			break
+		}
+	}
+
+	return dropEmptyRoutesAndReindex(improved)
+}
+
 // orOptImproveSolution repeatedly looks for a single customer whose best
 // feasible reinsertion point (via findBestInsertion, searched across every
 // route including its own current one) is cheaper than leaving it where it
@@ -1726,13 +2069,187 @@ func orOptImproveSolution(sol Solution, customers map[int]Customer, depot Custom
 
 	// Relocating every customer out of a route (e.g. because merging into
 	// one bigger route was cheaper than keeping two) leaves that route with
-	// zero customers - recalculateSolutionMetrics still counts it as a
-	// vehicle (TotalVehicles = len(Routes)), which would silently inflate
-	// the solution's primary objective. Drop empty routes and reindex
-	// before handing the result back; this also means Or-opt can discover
-	// route elimination as a side effect, not just distance improvements.
-	nonEmpty := make([]Route, 0, len(improved.Routes))
-	for _, r := range improved.Routes {
+	// zero customers - drop it and reindex (see dropEmptyRoutesAndReindex);
+	// this also means Or-opt can discover route elimination as a side
+	// effect, not just distance improvements.
+	return dropEmptyRoutesAndReindex(improved)
+}
+
+// findBestSegmentInsertion searches every (route, position, orientation)
+// combination across routes for the cheapest feasible place to insert a
+// contiguous segment (segIDs, order preserved) as a unit - tried both as
+// given and reversed, since reversing a segment's own internal order
+// doesn't change ITS internal distance (Euclidean distance is symmetric,
+// and those internal edges aren't part of this comparison anyway) but does
+// change which of its two ends ends up adjacent to the insertion point's
+// neighbors, which is standard Or-opt practice for segments of length >= 2.
+//
+// Only the two boundary edges change on insertion - prev->segFirst and
+// segLast->next replace prev->next - so an O(1) boundary-cost estimate is
+// computed for every candidate first, and calculateRouteDetails (the
+// expensive full-route feasibility/time-window check) only runs on a
+// candidate whose estimate could already beat the best CONFIRMED-feasible
+// cost found so far. Mirrors twoOptStarRoutePairBestMove's same discipline.
+func findBestSegmentInsertion(routes []Route, segIDs []int, customers map[int]Customer, depot Customer, capacity float64) (routeIdx, pos int, reversed bool, cost float64, feasible bool) {
+	routeIdx = -1
+	pos = -1
+	cost = 1e9
+
+	reversedSeg := make([]int, len(segIDs))
+	for i, id := range segIDs {
+		reversedSeg[len(segIDs)-1-i] = id
+	}
+
+	orientations := [2]struct {
+		seg      []int
+		reversed bool
+		first    Customer
+		last     Customer
+	}{
+		{segIDs, false, customers[segIDs[0]], customers[segIDs[len(segIDs)-1]]},
+		{reversedSeg, true, customers[segIDs[len(segIDs)-1]], customers[segIDs[0]]},
+	}
+
+	neighborBefore := func(ids []int, pos int) Customer {
+		if pos <= 0 {
+			return depot
+		}
+		return customers[ids[pos-1]]
+	}
+	neighborAfter := func(ids []int, pos int) Customer {
+		if pos >= len(ids) {
+			return depot
+		}
+		return customers[ids[pos]]
+	}
+
+	for rIdx, r := range routes {
+		ids := r.CustomerIDs
+		for p := 0; p <= len(ids); p++ {
+			prev := neighborBefore(ids, p)
+			next := neighborAfter(ids, p)
+			removedEdge := distance(prev, next)
+
+			for _, orient := range orientations {
+				estCost := (distance(prev, orient.first) + distance(orient.last, next)) - removedEdge
+				if estCost >= cost {
+					continue
+				}
+
+				testRoute := make([]int, 0, len(ids)+len(orient.seg))
+				testRoute = append(testRoute, ids[:p]...)
+				testRoute = append(testRoute, orient.seg...)
+				testRoute = append(testRoute, ids[p:]...)
+
+				rDetails, ok := calculateRouteDetails(testRoute, customers, depot, capacity)
+				if !ok {
+					continue
+				}
+				actualCost := rDetails.Distance - r.Distance
+				if actualCost < cost {
+					cost = actualCost
+					routeIdx = rIdx
+					pos = p
+					reversed = orient.reversed
+					feasible = true
+				}
+			}
+		}
+	}
+
+	return routeIdx, pos, reversed, cost, feasible
+}
+
+// orOptSegmentImproveSolution generalizes orOptImproveSolution to relocate a
+// contiguous segment of exactly segmentLen customers as a single unit
+// (segmentLen 1 is what orOptImproveSolution itself already covers - some
+// improvements only become visible when two or three neighboring customers
+// move together, preserving the edge between them, which single-customer
+// relocation can never consider). Same removal-savings-vs-insertion-cost
+// structure as orOptImproveSolution, at route-segment granularity: after any
+// accepted move, the current route is abandoned for the rest of this pass
+// (its shape just changed under it) and picked up fresh next pass, rather
+// than continuing to scan now-stale segment positions.
+func orOptSegmentImproveSolution(sol Solution, customers map[int]Customer, depot Customer, capacity float64, segmentLen, maxPasses int) Solution {
+	improved := cloneSolution(sol)
+	if segmentLen < 2 {
+		return improved
+	}
+
+	for pass := 0; pass < maxPasses; pass++ {
+		anyImprovement := false
+
+		for rIdx := 0; rIdx < len(improved.Routes); rIdx++ {
+			ids := improved.Routes[rIdx].CustomerIDs
+			if len(ids) < segmentLen {
+				continue
+			}
+
+			for start := 0; start+segmentLen <= len(ids); start++ {
+				segIDs := append([]int(nil), ids[start:start+segmentLen]...)
+
+				withoutIDs := make([]int, 0, len(ids)-segmentLen)
+				withoutIDs = append(withoutIDs, ids[:start]...)
+				withoutIDs = append(withoutIDs, ids[start+segmentLen:]...)
+
+				withoutDetails, ok := calculateRouteDetails(withoutIDs, customers, depot, capacity)
+				if !ok {
+					continue // removing a segment can't break feasibility; defensive only
+				}
+				removalSavings := improved.Routes[rIdx].Distance - withoutDetails.Distance
+
+				trial := make([]Route, len(improved.Routes))
+				copy(trial, improved.Routes)
+				withoutDetails.VehicleID = improved.Routes[rIdx].VehicleID
+				trial[rIdx] = withoutDetails
+
+				bestRouteIdx, bestPos, reversed, insCost, feasible := findBestSegmentInsertion(trial, segIDs, customers, depot, capacity)
+				if !feasible || insCost >= removalSavings-1e-9 {
+					continue
+				}
+
+				insertIDs := segIDs
+				if reversed {
+					insertIDs = make([]int, segmentLen)
+					for i, id := range segIDs {
+						insertIDs[segmentLen-1-i] = id
+					}
+				}
+
+				r := &trial[bestRouteIdx]
+				newIDs := make([]int, 0, len(r.CustomerIDs)+segmentLen)
+				newIDs = append(newIDs, r.CustomerIDs[:bestPos]...)
+				newIDs = append(newIDs, insertIDs...)
+				newIDs = append(newIDs, r.CustomerIDs[bestPos:]...)
+				rDetails, _ := calculateRouteDetails(newIDs, customers, depot, capacity)
+				rDetails.VehicleID = r.VehicleID
+				trial[bestRouteIdx] = rDetails
+
+				improved.Routes = trial
+				anyImprovement = true
+				break // route rIdx's shape just changed - stop scanning it this pass
+			}
+		}
+
+		recalculateSolutionMetrics(&improved)
+		if !anyImprovement {
+			break
+		}
+	}
+
+	return dropEmptyRoutesAndReindex(improved)
+}
+
+// dropEmptyRoutesAndReindex removes any route left with zero customers - a
+// side effect any cross-route operator can produce (relocating every
+// customer out of a route, or a 2-opt* cut that assigns nothing to one
+// side) - and renumbers VehicleID contiguously from 1.
+// recalculateSolutionMetrics still counts an empty route as a vehicle
+// (TotalVehicles = len(Routes)), which would silently inflate the
+// solution's primary objective if left in.
+func dropEmptyRoutesAndReindex(sol Solution) Solution {
+	nonEmpty := make([]Route, 0, len(sol.Routes))
+	for _, r := range sol.Routes {
 		if len(r.CustomerIDs) > 0 {
 			nonEmpty = append(nonEmpty, r)
 		}
@@ -1740,30 +2257,62 @@ func orOptImproveSolution(sol Solution, customers map[int]Customer, depot Custom
 	for idx := range nonEmpty {
 		nonEmpty[idx].VehicleID = idx + 1
 	}
-	improved.Routes = nonEmpty
-	recalculateSolutionMetrics(&improved)
-
-	return improved
+	sol.Routes = nonEmpty
+	recalculateSolutionMetrics(&sol)
+	return sol
 }
 
-// localSearchImprove alternates twoOptRoute (intra-route reordering) and
-// orOptImproveSolution (cross-route relocation) until a full round of both
-// yields no further distance improvement, or maxRounds is hit. Alternating
-// rather than running either just once matters because each can re-open
-// opportunities for the other: an Or-opt relocation can leave a route in a
-// shape 2-opt can now untangle further, and vice versa.
+// localSearchImprove alternates twoOptRoute (intra-route reordering),
+// twoOptStarImproveSolution (inter-route tail swap), orOptImproveSolution
+// (cross-route single-customer relocation), and orOptSegmentImproveSolution
+// (cross-route 2- and 3-customer segment relocation) until a full round of
+// all four yields no further distance improvement, or maxRounds is hit.
+// Alternating rather than running each just once matters because each can
+// re-open opportunities for the others: an Or-opt relocation can leave a
+// route in a shape 2-opt can now untangle further, a 2-opt* tail swap can
+// put two customers next to each other that Or-opt can now relocate
+// profitably, and a segment relocation can free up a position single-
+// customer Or-opt can then fill.
 func localSearchImprove(sol Solution, customers map[int]Customer, depot Customer, capacity float64) Solution {
 	improved := sol
 	const maxRounds = 5
 	for round := 0; round < maxRounds; round++ {
 		before := improved.TotalDistance
 		improved = twoOptImproveSolution(improved, customers, depot, capacity)
+		improved = twoOptStarImproveSolution(improved, customers, depot, capacity, 3)
 		improved = orOptImproveSolution(improved, customers, depot, capacity, 3)
+		improved = orOptSegmentImproveSolution(improved, customers, depot, capacity, 2, 3)
+		improved = orOptSegmentImproveSolution(improved, customers, depot, capacity, 3, 3)
 		if improved.TotalDistance >= before-1e-6 {
 			break
 		}
 	}
 	return improved
+}
+
+// mergeStagnationSubSolution reassembles the full solution after a
+// stagnation sub-solve: untouchedRoutes are the routes the intervention
+// didn't touch, subSol is the (already re-solved) replacement for the
+// destroyed routes. The stagnation sub-solve only ever tightens subSol in
+// isolation (or skips tightening entirely on the LKH path, which searches
+// far more thoroughly than a 2-opt/Or-opt pass over its output would add) -
+// neither path ever looks at the seam between untouchedRoutes and
+// subSol.Routes, so a customer that would clearly be cheaper served by an
+// untouched route can survive right where greedy re-insertion first put it.
+// Running a full localSearchImprove pass over the merged solution closes
+// that gap.
+func mergeStagnationSubSolution(untouchedRoutes []Route, subSol Solution, customers map[int]Customer, depot Customer, capacity float64) Solution {
+	mergedRoutes := make([]Route, 0, len(untouchedRoutes)+len(subSol.Routes))
+	mergedRoutes = append(mergedRoutes, untouchedRoutes...)
+	mergedRoutes = append(mergedRoutes, subSol.Routes...)
+
+	for idx := range mergedRoutes {
+		mergedRoutes[idx].VehicleID = idx + 1
+	}
+
+	mergedSol := Solution{Routes: mergedRoutes}
+	recalculateSolutionMetrics(&mergedSol)
+	return localSearchImprove(mergedSol, customers, depot, capacity)
 }
 
 // routeEliminationShuffleBudget bounds how many "yank some survivors back

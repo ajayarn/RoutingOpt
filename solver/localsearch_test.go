@@ -80,8 +80,12 @@ func TestOrOptImproveSolutionRelocatesAcrossRoutes(t *testing.T) {
 
 // TestLocalSearchImproveNeverWorsensOrDropsCustomers is a broader smoke test
 // over a bigger, less hand-tuned instance: whatever localSearchImprove does,
-// it must never increase distance, change vehicle count, or lose/duplicate a
-// customer.
+// it must never increase distance or vehicle count, or lose/duplicate a
+// customer. Vehicle count may legitimately DECREASE - with twoOptStarImproveSolution
+// in the mix, a tail swap that empties one side is a full-route merge, and on
+// this tightly-clustered, capacity-unbounded fixture that merge is a real
+// improvement (same invariant TestOrOptImproveSolutionRelocatesAcrossRoutes
+// already uses for the same reason).
 func TestLocalSearchImproveNeverWorsensOrDropsCustomers(t *testing.T) {
 	customers := map[int]Customer{
 		0:  {ID: 0, X: 40, Y: 50, DueDate: 1000},
@@ -105,8 +109,8 @@ func TestLocalSearchImproveNeverWorsensOrDropsCustomers(t *testing.T) {
 
 	got := localSearchImprove(sol, customers, depot, 1e9)
 
-	if got.TotalVehicles != sol.TotalVehicles {
-		t.Fatalf("localSearchImprove() changed vehicle count: got %d, want %d", got.TotalVehicles, sol.TotalVehicles)
+	if got.TotalVehicles > sol.TotalVehicles {
+		t.Fatalf("localSearchImprove() increased vehicle count: got %d, want <= %d", got.TotalVehicles, sol.TotalVehicles)
 	}
 	if got.TotalDistance > sol.TotalDistance+1e-9 {
 		t.Fatalf("localSearchImprove() worsened distance: got %.4f, want <= %.4f", got.TotalDistance, sol.TotalDistance)
