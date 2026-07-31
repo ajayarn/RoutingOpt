@@ -83,7 +83,7 @@ preprocessing pass — abandoned in favor of the header-patching approach above.
 
 ## Stack
 
-- **Frontend**: React 19 + Vite 6 + Tailwind 4 (`src/App.tsx`, single ~1450-line component;
+- **Frontend**: React 19 + Vite 6 + Tailwind 4 (`src/App.tsx`, single ~1590-line component;
   `src/types.ts` for shared types; `src/index.css`). Uses `lucide-react` for icons, `motion` for
   animation.
 - **Backend**: Express 4 (`server.ts`), run via `tsx` in dev (Vite in middleware mode) or bundled
@@ -141,7 +141,7 @@ npm run dev      # tsx server.ts — Express + Vite middleware, http://localhost
 npm run build     # vite build (frontend, copies public/ verbatim into dist/) + esbuild bundle of server.ts -> dist/server.cjs
 npm start         # node dist/server.cjs (prod)
 npm run lint      # tsc --noEmit
-npm run clean     # rm -rf dist server.js solver_bin
+npm run clean     # rm -rf dist solver_bin
 
 ./build_solver.sh          # compiles solver/main.go + solver/lkh_native.go -> solver_bin (native CLI, standalone use only)
 ./solver_bin -file public/data/c101.txt -iterations 1000   # standalone Go solver
@@ -294,5 +294,6 @@ Two things make a plain `vite build` output actually work when served from a sub
 ## Feasibility
 
 Time windows and capacity are checked before any candidate route/solution is accepted
-(`isRouteFeasible` in TS, `calculateRouteDetails` in Go) — this must hold in both solver
-implementations, and LKH3's output specifically is never trusted without this check (see above).
+(`calculateRouteDetails` in Go — the only solver implementation left in this repo now that
+`solver_engine.ts` is gone, see "Stack") — there is no other path by which a route enters a
+`Solution`, and LKH3's output specifically is never trusted without this check (see above).
