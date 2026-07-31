@@ -30,17 +30,13 @@ export interface SolverSolution {
   routes: Route[];
   totalDistance: number;
   totalVehicles: number;
-  isFeasible: boolean;
   computationTimeMs: number;
   iteration?: number;
 }
 
 export interface SolverParams {
   maxIterations: number;
-  populationSize?: number;
-  mutationRate?: number;
-  destroyRate?: number;
-  llmThreshold?: number;
+  stagnationThreshold?: number;
   useLkh?: boolean;
 }
 

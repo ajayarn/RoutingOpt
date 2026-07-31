@@ -19,27 +19,23 @@ anything on the critical path (see "API surface").
 
 It was originally scaffolded by Google AI Studio (`metadata.json`, `majorCapabilities:
 MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API`) and used Gemini, then local Ollama, as an LLM-guided
-destroy-operator selector. **That entire LLM-destroy feature has been removed from the running
-app** (no more `/api/llm-destroy`, no more "Use Ollama LLM" toggle) — see "History: the removed
-Ollama LLM step" below if you're wondering where it went.
+destroy-operator selector. **That entire LLM-destroy feature has been fully deleted** (not just
+removed from the running app) — see "History: the removed Ollama LLM step" below if you're
+wondering where it went.
 
-There are **two independent solver implementations** in this repo — know which one you're
-touching:
+The Go solver (`solver/main.go`) is the only solver implementation in this repo. It's compiled to
+WASM (`public/wasm/solver.wasm`) and run in a browser Web Worker (`public/solverWorker.js`), and is
+also still buildable as a native CLI binary (`solver_bin`, via `./build_solver.sh`) for standalone
+testing/benchmarking outside the browser — nothing in the running app spawns this binary anymore.
+It has a Solomon I1 sequential insertion heuristic for the initial solution, a pure-Go stagnation
+heuristic (`selectStagnationRoutesHeuristically`) as its default destroy-selection mechanism when
+stagnated, and an optional LKH3 sub-solver (see below).
 
-1. **Go solver (`solver/main.go`)** — the one actually wired into the running app, compiled to
-   WASM (`public/wasm/solver.wasm`) and run in a browser Web Worker (`public/solverWorker.js`).
-   It's also still buildable as a native CLI binary (`solver_bin`, via `./build_solver.sh`) for
-   standalone testing/benchmarking outside the browser — nothing in the running app spawns this
-   binary anymore. It has a Solomon I1 sequential insertion heuristic for the initial solution, a pure-Go stagnation
-   heuristic (`selectStagnationRoutesHeuristically`) as its default destroy-selection mechanism
-   when stagnated, and an optional LKH3 sub-solver (see below).
-2. **TypeScript solver (`solver_engine.ts`)** — kept in the repo but **not used** anywhere. It was
-   the original (accidental) default before the app was rewired to run the Go solver; it still
-   works standalone if imported directly, but nothing currently calls it.
-
-Both implementations parse the same Solomon-format files and target the same problem, but their
-algorithms (destroy/repair operators, acceptance criteria) have diverged — don't assume a fix in
-one applies to the other.
+An earlier, since-deleted `solver_engine.ts` held a second, TypeScript reimplementation of the
+same problem (angular-sweep construction, 2-opt/relocate local search, Shaw/random/whole-route
+destroy, regret-2 repair) — it was the original (accidental) default before the app was rewired to
+run the Go solver, but nothing ever called it after that rewiring, so it was removed rather than
+kept around as reference.
 
 ### LKH3 stagnation sub-solver (`-use-lkh`)
 
@@ -91,8 +87,8 @@ preprocessing pass — abandoned in favor of the header-patching approach above.
   `src/types.ts` for shared types; `src/index.css`). Uses `lucide-react` for icons, `motion` for
   animation.
 - **Backend**: Express 4 (`server.ts`), run via `tsx` in dev (Vite in middleware mode) or bundled
-  with `esbuild` to `dist/server.cjs` for prod. Serves parsed/raw instance data and static assets
-  only — no solver logic, no child processes.
+  with `esbuild` to `dist/server.cjs` for prod. Purely a Vite dev-server/static-file wrapper now —
+  no API routes, no solver logic, no child processes (see "API surface").
 - **Client-side execution**: `public/solverWorker.js` is a classic (non-ESM, so `importScripts`
   works) Web Worker that loads `wasm_exec.js` (Go's wasm runtime glue) and `lkh_wasm.js`
   (Emscripten's glue for the LKH wasm module), then runs `solver.wasm`. Two things it has to
@@ -107,7 +103,16 @@ preprocessing pass — abandoned in favor of the header-patching approach above.
     pre-instantiated LKH module instances rather than one shared instance — LKH's C globals are
     never reset between `callMain` calls within a single module instance, so reusing one instance
     across sub-solve calls risks stale-state corruption. Each call pops a fresh instance and an
-    async refill tops the pool back up in the background.
+    async refill (guarded against overlapping itself - see `lkhPoolRefilling`) tops the pool back
+    up in the background.
+    - **Known issue**: an occasional Emscripten `ErrnoError` from inside one `__lkhWasmSolve` call
+      (root cause not yet isolated - reproduced under an aggressive stagnation-threshold stress
+      test, pre-dates this cleanup pass) can leave the pool permanently unable to refill for the
+      rest of that solve, after which every stagnation intervention silently falls back to the
+      pure-Go sub-solver instead of LKH3 for the remainder of the run. Results stay correct
+      (feasibility is still enforced, see "Feasibility") - this only degrades solve *quality* by
+      losing the LKH boost, silently. Worth root-causing if `-use-lkh` runs are ending up
+      LKH-less more often than expected.
   - stdout (`fmt.Println(json)` in `main.go`) is line-buffered in the shim and forwarded to the
     main thread via `postMessage` instead of `console.log`, preserving the same
     one-JSON-message-per-line protocol the old SSE relay used.
@@ -122,10 +127,11 @@ preprocessing pass — abandoned in favor of the header-patching approach above.
 The app used to have an LLM-guided destroy-operator selector: `server.ts`'s `/api/llm-destroy`
 endpoint called local Ollama (`ollama_client.ts`, `http://localhost:11434`, model `gemma4:12b`),
 invoked from `solver/main.go`'s `invokeLLMToSelectTrucks` (native build only) when a `-use-llm`
-flag was set, exposed as a "Use Ollama LLM for destroy selection" UI toggle. This has been fully
-removed from the running app (endpoint deleted, toggle deleted, worker never passes `-use-llm`).
-`ollama_client.ts` and the `-use-llm` flag/`invokeLLMToSelectTrucks` function still exist in
-`solver/main.go` for standalone native-CLI use, but nothing in the browser path reaches them.
+flag was set, exposed as a "Use Ollama LLM for destroy selection" UI toggle. The `/api/llm-destroy`
+endpoint was deleted first, which silently broke `-use-llm` (it POSTed to a route that no longer
+existed and always fell through to the heuristic) — the flag, `invokeLLMToSelectTrucks`, and
+`ollama_client.ts` sat around broken and unused until this cleanup pass deleted all of them
+outright. There is no LLM-guided destroy path left anywhere in this repo, native or browser.
 
 ## Commands
 
@@ -145,13 +151,15 @@ npm run clean     # rm -rf dist server.js solver_bin
 ./build_solver_wasm.sh      # compiles solver/main.go + solver/lkh_wasm.go -> public/wasm/solver.wasm, copies wasm_exec.js + lkh_wasm.{js,wasm} into public/wasm/ (requires build_lkh_wasm.sh to have run first)
 ```
 
-`solver_bin`/`lkh_bin` (native binaries) are committed to the repo (not gitignored) — rebuild them
-with `./build_solver.sh`/`./build_lkh.sh` after editing their sources, don't hand-edit the
-binaries. `public/wasm/*` (the browser-facing artifacts) are **not** committed as of this writing;
-rebuild with `./build_lkh_wasm.sh && ./build_solver_wasm.sh` after editing `solver/main.go`,
-`solver/lkh_wasm.go`, or `lkh3src/` — **the running web app depends on these existing** (the
-frontend fetches `/wasm/solver.wasm` directly), so stale or missing files there mean the UI's
-"Start Solving" button will fail at fetch time.
+`solver_bin`/`lkh_bin` (native binaries) and `public/wasm/*` (the browser-facing artifacts,
+including `lkh_wasm.js`/`lkh_wasm.wasm`) are all committed to the repo (not gitignored) — rebuild
+them with `./build_solver.sh`/`./build_lkh.sh`/`./build_solver_wasm.sh` after editing their
+sources and commit the results, don't hand-edit the binaries. `./build_lkh_wasm.sh` only needs to
+run again if `lkh3src/` itself changes (it also needs `tools/emsdk/`, gitignored - see the script
+for setup); `build_solver_wasm.sh` reuses its output (`lkh_wasm.cjs`/`lkh_wasm.wasm` at repo root)
+otherwise. **The running web app depends on `public/wasm/*` existing** (the frontend fetches
+`wasm/solver.wasm` directly), so stale or missing files there mean the UI's "Start Solving" button
+will fail at fetch time.
 
 ## Problem data
 
@@ -162,12 +170,12 @@ copy), in the standard Solomon text format (name / VEHICLE NUMBER+CAPACITY / CUS
 copies it into `dist/data/*.txt` automatically - required for the static GitHub Pages deploy,
 where there's no server to ask for a file listing or a parsed instance.
 
-There are **two parsers** for this format now, not three - `src/parseSolomon.ts` (used by the
-frontend: instance listing, instance detail, upload) and `parseSolomonFile` in `solver/main.go`
-(Go, used by the actual solve). `server.ts` still has its own near-identical copy of the same
-logic backing its now-frontend-unused `/api/instances*` routes (see "API surface") - if you
-change the parsing logic or the Solomon format assumptions, update all three, though only
-`src/parseSolomon.ts` and `solver/main.go`'s are actually load-bearing for the running app.
+There are **two parsers** for this format - `src/parseSolomon.ts` (used by the frontend: instance
+listing, instance detail, upload) and `parseSolomonFile` in `solver/main.go` (Go, used by the
+actual solve). `server.ts` used to have its own near-identical copy backing now-deleted
+`/api/instances*` routes (see "API surface") - that copy is gone along with the routes it served,
+so these two are the only parsers left; if you change the parsing logic or the Solomon format
+assumptions, update both.
 
 Users can upload custom instances via the UI's upload modal - handled entirely client-side now
 (`handleUpload` in `src/App.tsx` parses the pasted text with `parseSolomon.ts` and holds it in an
@@ -175,13 +183,18 @@ in-memory `uploadedInstanceText` map), since a static deploy has nowhere to pers
 file to. Uploads are session-only - gone on refresh - and behave identically whether running via
 `npm run dev` or the deployed static site (no dev/prod divergence).
 
-Best-known solution distances used for early-stop are in `src/App.tsx`'s `BEST_KNOWN_SOLUTIONS`
-(client-side only — `server.ts` has no copy), scraped from
-https://www.sintef.no/projectweb/top/vrptw/100-customers/ for all 56 instances. Trust that table
-over any other hardcoded value you find - the original hand-entered values for r101 and rc201 in
-this file's history were wrong (rc201's was actually rc103's value).
+Best-known solution distances, used only for the UI's gap-to-optimal display and "Load Optimal
+Sequence" reference view (never sent to the solver - there is no solver-side early-stop feature),
+are in `src/App.tsx`'s `BEST_KNOWN_SOLUTIONS` (client-side only — `server.ts` has no copy), scraped
+from https://www.sintef.no/projectweb/top/vrptw/100-customers/ for all 56 instances. Trust that
+table over any other hardcoded value you find - the original hand-entered values for r101 and
+rc201 in this file's history were wrong (rc201's was actually rc103's value).
 
 ## Solver algorithm (Go path, `solver/main.go` — the one the web app runs, via WASM)
+
+**[README.md](README.md) is the full algorithmic writeup** (aimed at an OR audience, with
+diagrams) - this section is just an engineering-oriented index into it, plus the flag/build
+details README.md doesn't cover.
 
 - **Initial solution**: Solomon I1 sequential insertion (`buildInitialSolution`) — one route at a
   time from the full unrouted pool, seeded by farthest-from-depot, filled by c1 (distance +
@@ -191,57 +204,69 @@ this file's history were wrong (rc201's was actually rc103's value).
   Budgeted at 10% of `-iterations`, logged under the `VEHICLE-MIN` category. See
   `docs/superpowers/specs/2026-07-27-route-elimination-operator-design.md` for why this runs
   up front rather than only reactively.
-- **Destroy operators**: worst-distance and random removal (`destroyWorst`/`destroyRandom`), plus
-  Route Elimination (`destroyRouteElimination` + `repairGreedyNoNewRoute`, orchestrated by
-  `tryRouteElimination`) - fired 20% of the time in the main loop (vs. 40%/40% for
-  Worst/Random; see `chooseDestroyOperator`). Route Elimination exists because the other two
-  operators can't reliably reduce vehicle count on their own.
+- **Local search**: `localSearchImprove` alternates four operators to convergence (or a 5-round
+  cap) after construction, after every accepted destroy/repair candidate, and after a stagnation
+  merge (see below) - intra-route 2-opt (`twoOptRoute`), inter-route tail-swap 2-opt*
+  (`twoOptStarImproveSolution`), single-customer cross-route Or-opt (`orOptImproveSolution`), and
+  2/3-customer segment cross-route Or-opt (`orOptSegmentImproveSolution`). The last three are
+  cross-route moves 2-opt alone can't make; 2-opt* and the segment variant both use an O(1)
+  boundary-delta pre-filter before the expensive feasibility check, since only the edges at the
+  cut/insertion point change. See README.md's "Local search" section for the full mechanics.
+- **Destroy operators**: four ALNS-roulette-weighted operators - Route Elimination, Worst Destroy,
+  Random Destroy, and Shaw (relatedness-based) Destroy - chosen each iteration by adaptive
+  roulette-wheel weighting (`alnsWeights`), not a fixed split. Weights start equal and are
+  reweighted every 50 iterations from each operator's average reward that segment (new-best >
+  tied-vehicle improvement > accepted-but-worse > nothing for a reject). A fifth mechanism, **Long-
+  Edge Destroy**, sits outside this roulette entirely: a forced intervention (checked every
+  iteration, same pattern as the stagnation intervention below) that fires when the current
+  solution's worst customer-to-customer edge is a statistical outlier (`detectLongEdgeOutlier`,
+  `mean + 2.5·stddev` of that solution's own customer-to-customer edges, depot legs excluded), and
+  anchors a Shaw-style removal directly at that edge's two endpoints (`destroyShawSeeded`) instead
+  of Shaw Destroy's random seed. Capped at one forced attempt per specific flagged edge (detection
+  re-runs every iteration, so a persisting problem gets re-evaluated later rather than starving the
+  roulette or being retried needlessly on an edge that isn't resolving) and never credited/
+  penalized via `alnsWeights`. See README.md's "Destroy operators" section for the full mechanics
+  and Shaw removal's relatedness formula.
 - **Repair**: greedy insertion (`repairGreedy`); Route Elimination uses
   `repairGreedyNoNewRoute` instead (reinsertion into existing routes only, never opens a new
   one).
-- **Acceptance**: always accept on reduced fleet size or distance; random destroys always accepted
-  to keep exploring.
-- **Stagnation intervention**: after `-llm-threshold` iterations with no improvement, destroys
-  2–5 routes and re-solves the freed customers, escalating destroy size across up to 3 attempts if
-  it doesn't improve. Route re-solving is either the pure-Go heuristic
-  (`selectStagnationRoutesHeuristically`, default) or LKH3 (`invokeLKHSubSolver`) depending on
-  `-use-lkh` — see above. (Despite the flag's name, `-llm-threshold` is just the stagnation
-  iteration count; it predates the LKH3 work and hasn't been renamed.)
-- **Early stop**: `-optimal <distance>` ends the run once within 0.1% of that distance; the
-  frontend already sends this for instances with a known best solution (see "Problem data").
+- **Acceptance**: always accept on reduced fleet size or distance; within a tied vehicle count, a
+  worse-distance candidate is accepted via a simulated-annealing Metropolis criterion
+  (`simulatedAnnealingAccept`) with a geometrically-cooling temperature schedule - never applies
+  across a worse vehicle count, so the hierarchical objective can't be relaxed by temperature.
+- **Stagnation intervention**: after `-stagnation-threshold` iterations with no improvement,
+  destroys 2–5 routes (selected by route-level relatedness - `selectStagnationRoutesHeuristically`
+  → `mostRelatedRoutes`, reusing the same `customerRelatedness` scoring Shaw removal uses) and
+  re-solves the freed customers, escalating destroy size across up to 3 attempts if it doesn't
+  improve. Route re-solving is either the pure-Go heuristic (default) or LKH3
+  (`invokeLKHSubSolver`) depending on `-use-lkh` — see above. The re-solved routes are merged back
+  with the untouched ones via `mergeStagnationSubSolution`, which runs a full `localSearchImprove`
+  pass over the *merged* solution (not just the sub-solve in isolation) before accepting it - this
+  is what cleans up a bad connector edge at the seam between untouched and re-solved routes.
+- **Multi-start**: `-restarts N` (native CLI only, default 1, browser worker never passes anything
+  else) runs N full independent solves sequentially with seed, seed+1, ..., keeping the best
+  (`isBetterSolution`) as the final result.
+- There is no solver-side early-stop feature - the loop always runs the full `-iterations` count
+  (× `-restarts`, if set above 1). The UI's best-known-solution comparison (see "Problem data") is
+  purely a post-hoc display, not a stopping condition sent to the solver.
 
-## Solver algorithm (TS path, `solver_engine.ts` — unused, kept in repo)
+## API surface (`server.ts`) — there is none anymore
 
-- **Initial solution**: angular sweep + cheapest insertion (`createInitialSolution`).
-- **Local search**: 2-opt (`localSearch2Opt`) and cross-route relocate (`localSearchRelocate`).
-- **Destroy operators**: random, Shaw (distance + time-window similarity), and whole-route
-  removal, chosen randomly each iteration.
-- **Repair**: regret-2 insertion (`repairRegret2`), falls back to a new route if nothing fits.
-- **Acceptance**: always accept if vehicle count drops or distance improves; otherwise SA-style
-  probabilistic acceptance, with random/whole-route destroys always accepted to keep exploring.
-- Also contains a since-removed-from-the-app LLM destroy call (`ollamaGenerateJSON` inline in
-  `runSolverStream`) — vestigial, since nothing invokes this file at all.
+`server.ts` used to expose `GET /api/instances`, `GET /api/instances/:id`, and `POST /api/upload`,
+all backing frontend features that were rewritten to run entirely client-side (instance
+listing/detail parse `public/data/*.txt` directly via `src/parseSolomon.ts`; upload holds pasted
+text in an in-memory map - see "Problem data"). Once nothing called them, they were deleted along
+with their backing `parseSolomonText`/`Customer` duplicate-parser code, not just left unused.
 
-## API surface (`server.ts`) — none of this is used by the running app anymore
-
-`src/App.tsx` no longer calls any of these; they're left working for local `npm run dev` use
-(e.g. hitting them directly with curl) but are not load-bearing:
-
-- `GET /api/instances` — list available Solomon instances from `public/data/` (reads
-  `path.join(process.cwd(), 'public', 'data')` - update this path too if `public/data/` ever
-  moves again)
-- `GET /api/instances/:id` — parsed instance detail (JSON)
-- `POST /api/upload` — parse + write a custom Solomon-format instance to `public/data/<name>.txt`
-  (only persists for the current dev server process - does nothing useful against the deployed
-  static site, which is why the frontend doesn't use this anymore either)
-
-There's no `/data/*` static route anymore - it was redundant once `data/` moved under `public/`:
-Vite's own dev middleware and the production `express.static(distPath)` branch both already serve
-`public/`'s contents automatically.
+`server.ts` today is nothing but a Vite dev-server/static-file wrapper: Express app setup, Vite
+middleware in dev, `express.static(distPath)` + SPA fallback in prod. No routes, no request
+handlers, no child processes. There's no `/data/*` static route either - redundant once `data/`
+moved under `public/`, since Vite's dev middleware and the prod `express.static(distPath)` branch
+both already serve `public/`'s contents automatically.
 
 The actual solve runs entirely in the browser (see "Client-side execution") and instance
-data/listing/upload are all client-side now too (see "Problem data") - `server.ts` has no
-routes on the critical path at all.
+data/listing/upload are all client-side too (see "Problem data") - `server.ts` has nothing on the
+critical path at all; it only exists so `npm run dev`/`npm start` have something to run.
 
 ## Deployment: GitHub Pages
 

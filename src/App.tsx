@@ -6,12 +6,9 @@ import {
   Truck, 
   MapPin, 
   Clock, 
-  Layers, 
-  AlertCircle, 
-  CheckCircle, 
-  TrendingDown, 
-  ChevronRight, 
-  ChevronDown, 
+  Layers,
+  AlertCircle,
+  TrendingDown,
   Info,
   Sliders,
   FileText
@@ -179,7 +176,7 @@ export default function App() {
   // Solver parameters
   const [params, setParams] = useState<SolverParams>({
     maxIterations: 1000,
-    llmThreshold: 20,
+    stagnationThreshold: 20,
     useLkh: false
   });
 
@@ -194,7 +191,7 @@ export default function App() {
   const [progressHistory, setProgressHistory] = useState<Array<{ iteration: number; distance: number; vehicles: number }>>([]);
   const [activeMessage, setActiveMessage] = useState<string>('');
   const [solverLogs, setSolverLogs] = useState<string[]>([]);
-  const [logFilter, setLogFilter] = useState<'all' | 'improvements' | 'llm' | 'lns'>('all');
+  const [logFilter, setLogFilter] = useState<'all' | 'improvements' | 'heuristic' | 'lns'>('all');
   const [elapsedTime, setElapsedTime] = useState(0);
 
   // UI Selection states
@@ -257,6 +254,15 @@ export default function App() {
       logScrollRef.current.scrollTop = logScrollRef.current.scrollHeight;
     }
   }, [solverLogs, logFilter]);
+
+  // Terminate any in-flight solve worker on unmount, so a mid-solve
+  // navigation away doesn't leave the WASM solver burning CPU in the
+  // background or postMessage-ing into an unmounted component.
+  useEffect(() => {
+    return () => {
+      workerRef.current?.terminate();
+    };
+  }, []);
 
   // No backend to ask for the instance list or a parsed instance (this app
   // is a fully static site - GitHub Pages, no Express) - fetch each raw
@@ -382,7 +388,6 @@ export default function App() {
             routes: msg.routes,
             totalDistance: msg.bestDistance,
             totalVehicles: msg.bestVehicles,
-            isFeasible: true,
             computationTimeMs: msg.computationTimeMs || 0,
             iteration: msg.iteration
           };
@@ -409,9 +414,8 @@ export default function App() {
             routes: msg.routes,
             totalDistance: msg.bestDistance,
             totalVehicles: msg.bestVehicles,
-            isFeasible: true,
             computationTimeMs: msg.computationTimeMs || 0,
-            iteration: params.maxIterations
+            iteration: msg.iteration ?? params.maxIterations
           };
           setSolution(finalSol);
           const resultMsg = msg.message || 'Optimization completed successfully.';
@@ -444,7 +448,7 @@ export default function App() {
       instanceText,
       args: {
         iterations: params.maxIterations,
-        llmThreshold: params.llmThreshold ?? 20,
+        stagnationThreshold: params.stagnationThreshold ?? 20,
         useLkh: !!params.useLkh,
         seed: Date.now(),
       }
@@ -532,7 +536,6 @@ export default function App() {
       routes,
       totalDistance,
       totalVehicles,
-      isFeasible: true,
       computationTimeMs: 0,
       iteration: 0
     };
@@ -592,7 +595,10 @@ export default function App() {
           </div>
           <div>
             <h1 className="text-xl font-bold tracking-tight text-slate-900" id="header-title">VRPTW Optimization Engine</h1>
-            <p className="text-xs text-slate-500 font-normal">Vehicle Routing Problem with Time Windows Solver utilizing LNS metaheuristics with LLM-guided destroy operators</p>
+            <p className="text-xs text-slate-500 font-normal">
+              Vehicle Routing Problem with Time Windows Solver utilizing LNS metaheuristics with an optional LKH3 sub-solver
+              [Click: <a href="https://www.sintef.no/projectweb/top/vrptw/100-customers/" target="_problem">100 Customers</a>]
+            </p>
           </div>
         </div>
         <div className="flex items-center space-x-3">
@@ -647,21 +653,21 @@ export default function App() {
             {/* Stagnation Threshold */}
             <div className="mb-6">
               <div className="flex justify-between items-center mb-1.5">
-                <label className="block text-xs font-semibold text-slate-600" htmlFor="llm-threshold-input">
+                <label className="block text-xs font-semibold text-slate-600" htmlFor="stagnation-threshold-input">
                   Stagnation Threshold
                 </label>
                 <span className="text-xs text-blue-600 font-bold font-mono">
-                  {params.llmThreshold === 0 ? 'Disabled' : `Iter ${params.llmThreshold}`}
+                  {params.stagnationThreshold === 0 ? 'Disabled' : `Iter ${params.stagnationThreshold}`}
                 </span>
               </div>
               <input
-                id="llm-threshold-input"
+                id="stagnation-threshold-input"
                 type="number"
                 min="0"
                 max={params.maxIterations}
-                value={params.llmThreshold ?? 20}
+                value={params.stagnationThreshold ?? 20}
                 disabled={isSolving}
-                onChange={(e) => setParams(prev => ({ ...prev, llmThreshold: Math.max(0, parseInt(e.target.value) || 0) }))}
+                onChange={(e) => setParams(prev => ({ ...prev, stagnationThreshold: Math.max(0, parseInt(e.target.value) || 0) }))}
                 className="w-full text-sm border border-slate-300 rounded-lg p-2 bg-white focus:border-blue-500 focus:ring-1 focus:ring-blue-500 disabled:opacity-50"
               />
               <p className="text-[11px] text-slate-400 mt-1.5 leading-normal">
@@ -1247,18 +1253,18 @@ export default function App() {
 
                 {/* Filter Pills */}
                 <div className="flex flex-wrap gap-1 text-[10px]">
-                  {(['all', 'improvements', 'llm', 'lns'] as const).map((filter) => {
+                  {(['all', 'improvements', 'heuristic', 'lns'] as const).map((filter) => {
                     const label = {
                       all: 'All',
                       improvements: '🏆 Improvements',
-                      llm: '🧠 Smart Heuristic',
+                      heuristic: '🧠 Smart Heuristic',
                       lns: '⚡ LNS',
                     }[filter];
 
                     const activeStyle = {
                       all: 'bg-slate-700 text-white',
                       improvements: 'bg-emerald-800/80 text-emerald-200 border-emerald-700/50',
-                      llm: 'bg-violet-900 text-violet-200 border-violet-800',
+                      heuristic: 'bg-violet-900 text-violet-200 border-violet-800',
                       lns: 'bg-blue-900/60 text-blue-200 border-blue-800',
                     }[filter];
 
@@ -1292,8 +1298,8 @@ export default function App() {
                       if (logFilter === 'improvements') {
                         return log.includes('[NEW BEST]') || log.includes('[SUCCESS]') || log.includes('0.1%') || log.includes('Initial solution') || log.includes('started') || log.includes('results');
                       }
-                      if (logFilter === 'llm') {
-                        return log.includes('[LLM:') || log.includes('[HEURISTIC:') || log.includes('[LKH:') || log.includes('Ollama') || log.includes('Heuristic') || log.includes('LKH') || log.includes('Bypassing') || log.includes('Attempt');
+                      if (logFilter === 'heuristic') {
+                        return log.includes('[HEURISTIC:') || log.includes('[LKH:') || log.includes('Heuristic') || log.includes('LKH') || log.includes('Bypassing') || log.includes('Attempt');
                       }
                       if (logFilter === 'lns') {
                         return log.includes('[LNS:') || log.includes('Candidate');
@@ -1333,22 +1339,22 @@ export default function App() {
                             badgeStyle = "bg-emerald-900 text-emerald-300 border-emerald-800";
                             textStyle = "text-slate-300";
                           }
-                        } else if (category === 'LLM:TRIGGER' || category === 'HEURISTIC:TRIGGER') {
+                        } else if (category === 'HEURISTIC:TRIGGER') {
                           badgeStyle = "bg-violet-950 text-violet-400 border-violet-900";
                           textStyle = "text-violet-300";
-                        } else if (category === 'LLM:DECISION' || category === 'HEURISTIC:DECISION') {
+                        } else if (category === 'HEURISTIC:DECISION') {
                           badgeStyle = "bg-violet-900 text-violet-200 border-violet-800";
                           textStyle = "text-violet-100 font-semibold";
-                        } else if (category === 'LLM:SUB-SOLVER' || category === 'HEURISTIC:SUB-SOLVER') {
+                        } else if (category === 'HEURISTIC:SUB-SOLVER') {
                           badgeStyle = "bg-indigo-950 text-indigo-400 border-indigo-900";
                           textStyle = "text-slate-300";
-                        } else if (category === 'LLM:MERGE' || category === 'HEURISTIC:MERGE') {
+                        } else if (category === 'HEURISTIC:MERGE') {
                           badgeStyle = "bg-blue-950 text-blue-400 border-blue-950";
                           textStyle = "text-slate-400";
-                        } else if (category === 'LLM:SUCCESS' || category === 'HEURISTIC:SUCCESS') {
+                        } else if (category === 'HEURISTIC:SUCCESS') {
                           badgeStyle = "bg-emerald-500 text-white font-bold border-emerald-400";
                           textStyle = "text-emerald-300 font-bold animate-pulse";
-                        } else if (category === 'LLM:FAILURE' || category === 'HEURISTIC:FAILURE') {
+                        } else if (category === 'HEURISTIC:FAILURE') {
                           badgeStyle = "bg-rose-950 text-rose-400 border-rose-900";
                           textStyle = "text-rose-300/80";
                         } else if (category === 'LKH:TRIGGER') {
@@ -1377,10 +1383,10 @@ export default function App() {
 
                       // Default fallbacks (errors, starts)
                       const isError = log.toLowerCase().includes('error');
-                      const isOllama = log.includes('Ollama') || log.includes('LLM') || log.includes('LKH');
+                      const isHeuristicOrLkh = log.includes('Heuristic') || log.includes('LKH');
                       const defaultClass = isError
                         ? 'text-red-400 font-bold'
-                        : isOllama
+                        : isHeuristicOrLkh
                           ? 'text-violet-300 font-medium'
                           : 'text-slate-400';
 

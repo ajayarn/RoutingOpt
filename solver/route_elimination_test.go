@@ -501,22 +501,90 @@ func TestVehicleMinimizationPrePhaseRespectsZeroBudget(t *testing.T) {
 	}
 }
 
-func TestChooseDestroyOperatorSplit(t *testing.T) {
+func TestALNSWeightsChooseIsProportionalToEqualWeights(t *testing.T) {
+	w := newALNSWeights(4) // all weights start at 1.0 -> four equal 0.25-wide buckets
 	cases := []struct {
 		roll float64
-		want string
+		want int
 	}{
-		{0.0, "Route Elimination"},
-		{0.19, "Route Elimination"},
-		{0.20, "Worst Destroy"},
-		{0.59, "Worst Destroy"},
-		{0.60, "Random Destroy"},
-		{0.999, "Random Destroy"},
+		{0.0, 0},
+		{0.24, 0},
+		{0.25, 1},
+		{0.49, 1},
+		{0.50, 2},
+		{0.74, 2},
+		{0.75, 3},
+		{0.999, 3},
 	}
 	for _, c := range cases {
-		if got := chooseDestroyOperator(c.roll); got != c.want {
-			t.Errorf("chooseDestroyOperator(%.3f) = %q, want %q", c.roll, got, c.want)
+		if got := w.choose(c.roll); got != c.want {
+			t.Errorf("choose(%.3f) = %d, want %d", c.roll, got, c.want)
 		}
+	}
+}
+
+func TestALNSWeightsChooseRespectsUnequalWeights(t *testing.T) {
+	w := newALNSWeights(2)
+	w.weight = []float64{3.0, 1.0} // operator 0 should get 3/4 of the roll range
+
+	cases := []struct {
+		roll float64
+		want int
+	}{
+		{0.0, 0},
+		{0.74, 0},
+		{0.76, 1},
+		{0.999, 1},
+	}
+	for _, c := range cases {
+		if got := w.choose(c.roll); got != c.want {
+			t.Errorf("choose(%.3f) with weights %v = %d, want %d", c.roll, w.weight, got, c.want)
+		}
+	}
+}
+
+func TestALNSWeightsUpdateSegmentRewardsProductiveOperator(t *testing.T) {
+	w := newALNSWeights(2)
+	// Operator 0 earns a big reward every time it's tried; operator 1 earns
+	// nothing (as if every candidate it produced was rejected).
+	for i := 0; i < 5; i++ {
+		w.reward(0, alnsRewardNewBest)
+	}
+	w.updateSegment(alnsReactionFactor)
+
+	if w.weight[0] <= w.weight[1] {
+		t.Fatalf("after rewarding operator 0 and not operator 1, weight[0]=%.4f should exceed weight[1]=%.4f", w.weight[0], w.weight[1])
+	}
+}
+
+func TestALNSWeightsUpdateSegmentLeavesUnusedOperatorUnchanged(t *testing.T) {
+	w := newALNSWeights(2)
+	before := append([]float64(nil), w.weight...)
+
+	// Nothing rewarded this segment at all - neither operator was tried.
+	w.updateSegment(alnsReactionFactor)
+
+	for i := range w.weight {
+		if w.weight[i] != before[i] {
+			t.Fatalf("weight[%d] changed from %.4f to %.4f despite zero usage this segment - an untried operator must not be penalized", i, before[i], w.weight[i])
+		}
+	}
+}
+
+func TestALNSWeightsUpdateSegmentEnforcesMinWeight(t *testing.T) {
+	w := newALNSWeights(1)
+	// Reward with a score of 0 every segment - simulates an operator that's
+	// tried often but never produces an accepted candidate.
+	for segment := 0; segment < 50; segment++ {
+		w.reward(0, 0)
+		w.updateSegment(alnsReactionFactor)
+	}
+
+	if w.weight[0] < alnsMinWeight {
+		t.Fatalf("weight[0] = %.4f fell below the floor alnsMinWeight = %.4f", w.weight[0], alnsMinWeight)
+	}
+	if w.weight[0] > alnsMinWeight+1e-9 {
+		t.Fatalf("weight[0] = %.4f, want it to have settled at the floor alnsMinWeight = %.4f after 50 unproductive segments", w.weight[0], alnsMinWeight)
 	}
 }
 
